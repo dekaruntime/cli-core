@@ -3,6 +3,7 @@
 //! This crate intentionally exposes only the pieces that are ready to be shared:
 //! the common token file and linkhash `whoami` resolution.
 
+pub mod pulse_client;
 pub mod token_file;
 pub mod whoami;
 
