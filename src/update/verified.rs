@@ -195,10 +195,14 @@ fn path_identity(path: &std::path::Path) -> Result<(u64, u64), UpdateError> {
 
 #[cfg(not(unix))]
 fn file_identity(_: &File) -> Result<(u64, u64), UpdateError> {
-    Ok((0, 0))
+    Err(UpdateError::InvalidRequest(
+        "file identity verification is unsupported on this platform".into(),
+    ))
 }
 
 #[cfg(not(unix))]
 fn path_identity(_: &std::path::Path) -> Result<(u64, u64), UpdateError> {
-    Ok((0, 0))
+    Err(UpdateError::InvalidRequest(
+        "path identity verification is unsupported on this platform".into(),
+    ))
 }

@@ -1,5 +1,6 @@
 use std::{cell::RefCell, fs, io::Cursor, time::Duration};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Timelike as _, Utc};
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::json;
@@ -13,9 +14,12 @@ const FRESHNESS_KEY_ID: &str = "harar-freshness-test";
 const MANIFEST_DOMAIN: &[u8] = b"tana.release-manifest.v1\n";
 const ARTIFACT_DOMAIN: &[u8] = b"tana.release-artifact.v1\n";
 const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
+const ANCHOR_DOMAIN: &[u8] = b"tana.anchor-set.v1\n";
+const ROOT_KEY_ID: &str = "harar-root-test";
 
 struct Harness {
     root: TempDir,
+    root_key: SigningKey,
     release_key: SigningKey,
     freshness_key: SigningKey,
 }
@@ -24,6 +28,7 @@ impl Harness {
     fn new() -> Self {
         Self {
             root: tempfile::tempdir().unwrap(),
+            root_key: SigningKey::from_bytes(&[11; 32]),
             release_key: SigningKey::from_bytes(&[7; 32]),
             freshness_key: SigningKey::from_bytes(&[9; 32]),
         }
@@ -36,6 +41,7 @@ impl Harness {
     fn trust(&self) -> TrustStore {
         TrustStore::with_test_keys(
             self.root.path().join("trust"),
+            self.root_key.verifying_key(),
             RELEASE_KEY_ID,
             self.release_key.verifying_key(),
             FRESHNESS_KEY_ID,
@@ -111,7 +117,18 @@ impl Harness {
             "expires_at": expires
         }))
         .unwrap();
+        let (anchor_set, anchor_signatures) = self.anchor_set(
+            2,
+            RELEASE_KEY_ID,
+            &self.release_key,
+            "active",
+            FRESHNESS_KEY_ID,
+            &self.freshness_key,
+            "active",
+        );
         MockTransport::new(
+            anchor_set,
+            anchor_signatures,
             latest.clone(),
             sign(&self.freshness_key, LATEST_DOMAIN, &latest),
             manifest.clone(),
@@ -119,6 +136,61 @@ impl Harness {
             artifact.clone(),
             sign(&self.release_key, ARTIFACT_DOMAIN, &artifact),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn anchor_set(
+        &self,
+        generation: u64,
+        release_key_id: &str,
+        release_key: &SigningKey,
+        release_status: &str,
+        freshness_key_id: &str,
+        freshness_key: &SigningKey,
+        freshness_status: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let root_public = self.root_key.verifying_key();
+        let bytes = serde_json::to_vec(&json!({
+            "schema": "tana.anchor-set.v1",
+            "generation": generation,
+            "issued_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "threshold": 1,
+            "roots": [{
+                "key_id": ROOT_KEY_ID,
+                "public_key_base64": BASE64.encode(root_public.as_bytes()),
+                "fingerprint_sha256": hex_sha(root_public.as_bytes())
+            }],
+            "keys": [
+                {
+                    "role": "release",
+                    "key_id": release_key_id,
+                    "public_key_base64": BASE64.encode(release_key.verifying_key().as_bytes()),
+                    "not_before": "2026-01-01T00:00:00Z",
+                    "not_after": "2030-01-01T00:00:00Z",
+                    "status": release_status
+                },
+                {
+                    "role": "freshness",
+                    "key_id": freshness_key_id,
+                    "public_key_base64": BASE64.encode(freshness_key.verifying_key().as_bytes()),
+                    "not_before": "2026-01-01T00:00:00Z",
+                    "not_after": "2030-01-01T00:00:00Z",
+                    "status": freshness_status
+                }
+            ]
+        }))
+        .unwrap();
+        let signatures = serde_json::to_vec(&json!({
+            "schema": "tana.anchor-signatures.v1",
+            "signatures": [{
+                "key_id": ROOT_KEY_ID,
+                "algorithm": "ed25519",
+                "signature_base64": BASE64.encode(sign(&self.root_key, ANCHOR_DOMAIN, &bytes))
+            }]
+        }))
+        .unwrap();
+        (bytes, signatures)
     }
 }
 
@@ -133,6 +205,8 @@ struct FetchCounts {
 }
 
 struct MockTransport {
+    anchor_set: Vec<u8>,
+    anchor_signatures: Vec<u8>,
     latest: Vec<u8>,
     latest_sig: Vec<u8>,
     manifest: Vec<u8>,
@@ -144,7 +218,10 @@ struct MockTransport {
 }
 
 impl MockTransport {
+    #[allow(clippy::too_many_arguments)]
     fn new(
+        anchor_set: Vec<u8>,
+        anchor_signatures: Vec<u8>,
         latest: Vec<u8>,
         latest_sig: Vec<u8>,
         manifest: Vec<u8>,
@@ -153,6 +230,8 @@ impl MockTransport {
         artifact_sig: Vec<u8>,
     ) -> Self {
         Self {
+            anchor_set,
+            anchor_signatures,
             latest,
             latest_sig,
             manifest,
@@ -166,6 +245,8 @@ impl MockTransport {
 
     fn no_network() -> Self {
         Self {
+            anchor_set: vec![],
+            anchor_signatures: vec![],
             latest: vec![],
             latest_sig: vec![],
             manifest: vec![],
@@ -196,6 +277,14 @@ impl MockTransport {
 }
 
 impl ReleaseTransport for MockTransport {
+    fn fetch_anchor_set(&self, _: usize) -> Result<Vec<u8>, TransportError> {
+        self.fetched(&self.anchor_set)
+    }
+
+    fn fetch_anchor_signatures(&self, _: usize) -> Result<Vec<u8>, TransportError> {
+        self.fetched(&self.anchor_signatures)
+    }
+
     fn fetch_latest_statement(
         &self,
         _: &str,
@@ -409,6 +498,141 @@ fn failed_health_check_atomically_restores_verified_previous() {
     .unwrap_err();
     assert!(matches!(error, UpdateError::Health(_)));
     assert_eq!(fs::read(harness.install_path()).unwrap(), first_binary);
+}
+
+#[test]
+fn failed_first_install_removes_candidate_from_executable_path() {
+    let harness = Harness::new();
+    let unhealthy = harness.release("1.8.0", 1, "unhealthy");
+    let mut trust = harness.trust();
+    let error = verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &unhealthy,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap_err();
+    assert!(matches!(error, UpdateError::Health(_)));
+    assert!(!harness.install_path().exists());
+    let quarantine = harness
+        .install_path()
+        .parent()
+        .unwrap()
+        .join(".deka.tana-update/failed-candidate.bin");
+    assert!(quarantine.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(quarantine).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+}
+
+#[test]
+fn root_signed_rotation_accepts_new_release_key_and_persists_generation() {
+    const ROTATED_ID: &str = "harar-release-rotated";
+    let harness = Harness::new();
+    let rotated_key = SigningKey::from_bytes(&[21; 32]);
+    let mut transport = harness.release("1.8.0", 1, "rotated");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&transport.manifest).unwrap();
+    manifest["key_id"] = json!(ROTATED_ID);
+    transport.manifest = serde_json::to_vec(&manifest).unwrap();
+    transport.manifest_sig = sign(&rotated_key, MANIFEST_DOMAIN, &transport.manifest);
+    transport.artifact_sig = sign(&rotated_key, ARTIFACT_DOMAIN, &transport.artifact);
+    let mut latest: serde_json::Value = serde_json::from_slice(&transport.latest).unwrap();
+    latest["manifest_size"] = json!(transport.manifest.len());
+    latest["manifest_sha256"] = json!(hex_sha(&transport.manifest));
+    transport.latest = serde_json::to_vec(&latest).unwrap();
+    transport.latest_sig = sign(&harness.freshness_key, LATEST_DOMAIN, &transport.latest);
+    (transport.anchor_set, transport.anchor_signatures) = harness.anchor_set(
+        3,
+        ROTATED_ID,
+        &rotated_key,
+        "active",
+        FRESHNESS_KEY_ID,
+        &harness.freshness_key,
+        "active",
+    );
+
+    let trust_dir = harness.root.path().join("trust");
+    let mut trust = harness.trust();
+    verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &transport,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap();
+    drop(trust);
+    let reopened = TrustStore::with_test_keys(
+        trust_dir,
+        harness.root_key.verifying_key(),
+        RELEASE_KEY_ID,
+        harness.release_key.verifying_key(),
+        FRESHNESS_KEY_ID,
+        harness.freshness_key.verifying_key(),
+    )
+    .unwrap();
+    assert_eq!(reopened.generation(), 3);
+}
+
+#[test]
+fn root_signed_revocation_rejects_a_still_valid_old_signature() {
+    let harness = Harness::new();
+    let mut transport = harness.release("1.8.0", 1, "revoked");
+    (transport.anchor_set, transport.anchor_signatures) = harness.anchor_set(
+        3,
+        RELEASE_KEY_ID,
+        &harness.release_key,
+        "revoked",
+        FRESHNESS_KEY_ID,
+        &harness.freshness_key,
+        "active",
+    );
+    let mut trust = harness.trust();
+    let error = verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &transport,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        UpdateError::BadSignature("release manifest")
+    ));
+    assert!(!harness.install_path().exists());
+}
+
+#[test]
+fn unsigned_anchor_rotation_is_rejected_before_release_fetch() {
+    let harness = Harness::new();
+    let mut transport = harness.release("1.8.0", 1, "bad-anchor");
+    let index = transport.anchor_signatures.len() - 4;
+    transport.anchor_signatures[index] ^= 1;
+    let mut trust = harness.trust();
+    let error = verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &transport,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        UpdateError::BadSignature("anchor set") | UpdateError::Schema(_)
+    ));
+    assert_eq!(transport.counts.borrow().latest, 0);
 }
 
 fn sign(key: &SigningKey, domain: &[u8], bytes: &[u8]) -> Vec<u8> {

@@ -5,9 +5,14 @@
 //! non-`Clone` capability created only after every cryptographic and on-disk
 //! verification succeeds.
 
+#[cfg(not(unix))]
+compile_error!("signed self-update currently requires Unix atomic rename and inode semantics");
+
+mod http_transport;
 mod install;
 mod schema;
 mod trust;
+mod trust_anchor;
 mod verified;
 
 #[cfg(test)]
@@ -27,12 +32,15 @@ use self::{
     schema::{LatestStatement, ReleaseManifest},
 };
 
+pub use http_transport::HttpReleaseTransport;
 pub use install::AtomicInstaller;
 pub use trust::TrustStore;
 pub use verified::VerifiedArtifact;
 
 const MAX_LATEST_BYTES: usize = 16 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_ANCHOR_SET_BYTES: usize = 64 * 1024;
+const MAX_ANCHOR_SIGNATURE_BYTES: usize = 16 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// A validated registered CLI name.
@@ -138,6 +146,12 @@ impl ReleaseCoordinates<'_> {
 /// Hostile byte transport. Implementations must fetch each requested object at
 /// most once and return owned bytes; the core independently enforces bounds.
 pub trait ReleaseTransport {
+    /// Fetch the current root-signed online-key authorization statement.
+    fn fetch_anchor_set(&self, max_bytes: usize) -> Result<Vec<u8>, TransportError>;
+
+    /// Fetch the detached offline-root signatures for the anchor statement.
+    fn fetch_anchor_signatures(&self, max_bytes: usize) -> Result<Vec<u8>, TransportError>;
+
     fn fetch_latest_statement(
         &self,
         name: &str,
@@ -274,6 +288,18 @@ pub fn verify_and_install(
     if request.selector == VersionSelector::Rollback {
         return installer.rollback(&request);
     }
+
+    let anchor_set = bounded(
+        "anchor set",
+        transport.fetch_anchor_set(MAX_ANCHOR_SET_BYTES)?,
+        MAX_ANCHOR_SET_BYTES,
+    )?;
+    let anchor_signatures = bounded(
+        "anchor signatures",
+        transport.fetch_anchor_signatures(MAX_ANCHOR_SIGNATURE_BYTES)?,
+        MAX_ANCHOR_SIGNATURE_BYTES,
+    )?;
+    trust.accept_anchor_set(&anchor_set, &anchor_signatures)?;
 
     let accepted = match &request.selector {
         VersionSelector::Latest {

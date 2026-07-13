@@ -4,40 +4,52 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use super::{schema::LatestStatement, sha256_hex, UpdateError, UpdateRequest};
+use super::{
+    schema::LatestStatement,
+    sha256_hex,
+    trust_anchor::{AnchorSet, KeyRole, KeyStatus, OnlineKey, RootAnchor},
+    UpdateError, UpdateRequest,
+};
 
 const MANIFEST_DOMAIN: &[u8] = b"tana.release-manifest.v1\n";
 pub(super) const ARTIFACT_DOMAIN: &[u8] = b"tana.release-artifact.v1\n";
 const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
 
-// Compile-time trust anchors. These values are deliberately review-gated in
-// tana#722: changing any byte requires Sami's out-of-band fingerprint review.
-const HARAR_RELEASE_PUBLIC_KEY: [u8; 32] = [
+// PLACEHOLDER TRUST MATERIAL — NOT PRODUCTION HARAR KEYS.
+// Sami must replace and verify every root/online fingerprint out of band before
+// merge. A registry response can rotate/revoke online keys, never these roots.
+const PLACEHOLDER_HARAR_ROOT_A: [u8; 32] = [
+    102, 190, 126, 51, 44, 122, 69, 51, 50, 189, 157, 10, 127, 125, 176, 85, 245, 197, 239, 26, 6,
+    173, 166, 109, 152, 179, 159, 182, 129, 12, 71, 58,
+];
+const PLACEHOLDER_HARAR_ROOT_B: [u8; 32] = [
+    145, 162, 138, 11, 116, 56, 21, 147, 164, 217, 70, 149, 121, 32, 137, 38, 175, 200, 173, 130,
+    200, 131, 155, 118, 68, 53, 155, 158, 186, 154, 75, 58,
+];
+const PLACEHOLDER_HARAR_RELEASE_KEY: [u8; 32] = [
     49, 200, 51, 252, 70, 230, 84, 255, 45, 19, 39, 128, 208, 236, 28, 1, 182, 147, 176, 124, 191,
     197, 18, 190, 202, 27, 90, 145, 29, 170, 192, 142,
 ];
-const HARAR_FRESHNESS_PUBLIC_KEY: [u8; 32] = [
+const PLACEHOLDER_HARAR_FRESHNESS_KEY: [u8; 32] = [
     71, 144, 230, 106, 28, 64, 52, 115, 103, 182, 1, 11, 16, 235, 21, 221, 126, 250, 144, 82, 166,
     2, 59, 57, 105, 217, 97, 222, 123, 159, 240, 223,
 ];
-const HARAR_RELEASE_KEY_ID: &str = "harar-release-2026-q3";
-const HARAR_FRESHNESS_KEY_ID: &str = "harar-freshness-2026-q3";
+const RELEASE_KEY_ID: &str = "PLACEHOLDER-harar-release-2026-q3";
+const FRESHNESS_KEY_ID: &str = "PLACEHOLDER-harar-freshness-2026-q3";
 const COMPILED_ANCHOR_GENERATION: u64 = 1;
-
-#[derive(Clone)]
-struct Anchor {
-    key_id: String,
-    key: VerifyingKey,
-}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedTrust {
     generation: u64,
+    #[serde(default)]
+    anchor_set_sha256: String,
     latest: Vec<LatestFloor>,
 }
 
@@ -52,56 +64,54 @@ struct LatestFloor {
     version: Version,
 }
 
-/// Owner-only persistent monotonic trust state plus compiled Harar anchors.
+/// Owner-only monotonic trust state rooted in compiled offline Harar anchors.
 pub struct TrustStore {
     directory: PathBuf,
     state: PersistedTrust,
-    release_keys: Vec<Anchor>,
-    freshness_keys: Vec<Anchor>,
+    roots: Vec<RootAnchor>,
+    anchors: AnchorSet,
+    anchor_bytes_sha256: String,
 }
 
 impl TrustStore {
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, UpdateError> {
-        Self::open_with_key_material(
-            directory.into(),
-            [(
-                HARAR_RELEASE_KEY_ID.to_owned(),
-                VerifyingKey::from_bytes(&HARAR_RELEASE_PUBLIC_KEY).map_err(|error| {
-                    UpdateError::Schema(format!("compiled release anchor is invalid: {error}"))
-                })?,
-            )],
-            [(
-                HARAR_FRESHNESS_KEY_ID.to_owned(),
-                VerifyingKey::from_bytes(&HARAR_FRESHNESS_PUBLIC_KEY).map_err(|error| {
-                    UpdateError::Schema(format!("compiled freshness anchor is invalid: {error}"))
-                })?,
-            )],
-        )
+        let roots = vec![
+            root("PLACEHOLDER-harar-root-a", PLACEHOLDER_HARAR_ROOT_A)?,
+            root("PLACEHOLDER-harar-root-b", PLACEHOLDER_HARAR_ROOT_B)?,
+        ];
+        let anchors = AnchorSet::compiled(
+            COMPILED_ANCHOR_GENERATION,
+            &roots,
+            vec![
+                online(
+                    KeyRole::Release,
+                    RELEASE_KEY_ID,
+                    PLACEHOLDER_HARAR_RELEASE_KEY,
+                )?,
+                online(
+                    KeyRole::Freshness,
+                    FRESHNESS_KEY_ID,
+                    PLACEHOLDER_HARAR_FRESHNESS_KEY,
+                )?,
+            ],
+        );
+        Self::open_with_material(directory.into(), roots, anchors)
     }
 
-    fn open_with_key_material(
+    fn open_with_material(
         directory: PathBuf,
-        release_keys: impl IntoIterator<Item = (String, VerifyingKey)>,
-        freshness_keys: impl IntoIterator<Item = (String, VerifyingKey)>,
+        roots: Vec<RootAnchor>,
+        anchors: AnchorSet,
     ) -> Result<Self, UpdateError> {
         create_private_directory(&directory)?;
+        let anchor_bytes_sha256 = sha256_hex(&serde_json::to_vec(&anchors)?);
         let mut store = Self {
             directory,
             state: PersistedTrust::default(),
-            release_keys: release_keys
-                .into_iter()
-                .map(|(key_id, key)| Anchor { key_id, key })
-                .collect(),
-            freshness_keys: freshness_keys
-                .into_iter()
-                .map(|(key_id, key)| Anchor { key_id, key })
-                .collect(),
+            roots,
+            anchors,
+            anchor_bytes_sha256,
         };
-        if store.release_keys.is_empty() || store.freshness_keys.is_empty() {
-            return Err(UpdateError::Schema(
-                "compiled release and freshness anchors are required".into(),
-            ));
-        }
         store.reload()?;
         Ok(store)
     }
@@ -109,16 +119,25 @@ impl TrustStore {
     #[cfg(test)]
     pub(super) fn with_test_keys(
         directory: PathBuf,
+        root_key: VerifyingKey,
         release_key_id: &str,
         release_key: VerifyingKey,
         freshness_key_id: &str,
         freshness_key: VerifyingKey,
     ) -> Result<Self, UpdateError> {
-        Self::open_with_key_material(
-            directory,
-            [(release_key_id.to_owned(), release_key)],
-            [(freshness_key_id.to_owned(), freshness_key)],
-        )
+        let roots = vec![RootAnchor {
+            key_id: "harar-root-test",
+            key: root_key,
+        }];
+        let anchors = AnchorSet::compiled(
+            1,
+            &roots,
+            vec![
+                online_key(KeyRole::Release, release_key_id, release_key),
+                online_key(KeyRole::Freshness, freshness_key_id, freshness_key),
+            ],
+        );
+        Self::open_with_material(directory, roots, anchors)
     }
 
     pub(super) fn reload(&mut self) -> Result<(), UpdateError> {
@@ -129,6 +148,7 @@ impl TrustStore {
             })?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedTrust {
                 generation: COMPILED_ANCHOR_GENERATION,
+                anchor_set_sha256: self.anchor_bytes_sha256.clone(),
                 latest: Vec::new(),
             },
             Err(error) => return Err(error.into()),
@@ -138,6 +158,74 @@ impl TrustStore {
                 "persisted anchor generation is below the compiled floor".into(),
             ));
         }
+
+        let set_path = self.directory.join("anchor-set.json");
+        let sig_path = self.directory.join("anchor-set.sig.json");
+        match (fs::read(set_path), fs::read(sig_path)) {
+            (Ok(bytes), Ok(signatures)) => {
+                let set =
+                    AnchorSet::parse_and_verify(&bytes, &signatures, &self.roots, Utc::now())?;
+                let digest = sha256_hex(&bytes);
+                if set.generation < self.state.generation
+                    || (set.generation == self.state.generation
+                        && !self.state.anchor_set_sha256.is_empty()
+                        && digest != self.state.anchor_set_sha256)
+                {
+                    return Err(UpdateError::Freshness(
+                        "persisted anchor set is stale or equivocated".into(),
+                    ));
+                }
+                self.state.generation = set.generation;
+                self.state.anchor_set_sha256 = digest.clone();
+                self.anchors = set;
+                self.anchor_bytes_sha256 = digest;
+            }
+            (Err(a), Err(b))
+                if a.kind() == std::io::ErrorKind::NotFound
+                    && b.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if self.state.generation > COMPILED_ANCHOR_GENERATION {
+                    return Err(UpdateError::Freshness(
+                        "rotated anchor state is missing its signed document".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(UpdateError::Schema(
+                    "persisted anchor set/signature pair is incomplete".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn accept_anchor_set(
+        &mut self,
+        bytes: &[u8],
+        signatures: &[u8],
+    ) -> Result<(), UpdateError> {
+        let set = AnchorSet::parse_and_verify(bytes, signatures, &self.roots, Utc::now())?;
+        let digest = sha256_hex(bytes);
+        if set.generation < self.state.generation {
+            return Err(UpdateError::Freshness(format!(
+                "anchor generation {} is below persisted generation {}",
+                set.generation, self.state.generation
+            )));
+        }
+        if set.generation == self.state.generation && digest != self.anchor_bytes_sha256 {
+            return Err(UpdateError::Freshness(
+                "equal anchor generation arrived with different signed bytes".into(),
+            ));
+        }
+        if set.generation > self.state.generation {
+            atomic_private_write(&self.directory, "anchor-set.json", bytes)?;
+            atomic_private_write(&self.directory, "anchor-set.sig.json", signatures)?;
+            self.state.generation = set.generation;
+            self.state.anchor_set_sha256 = digest.clone();
+            self.persist()?;
+        }
+        self.anchors = set;
+        self.anchor_bytes_sha256 = digest;
         Ok(())
     }
 
@@ -150,8 +238,8 @@ impl TrustStore {
         bytes: &[u8],
         signature: &[u8],
     ) -> Result<String, UpdateError> {
-        verify_any(
-            &self.freshness_keys,
+        self.verify_any(
+            KeyRole::Freshness,
             LATEST_DOMAIN,
             bytes,
             signature,
@@ -164,8 +252,8 @@ impl TrustStore {
         bytes: &[u8],
         signature: &[u8],
     ) -> Result<String, UpdateError> {
-        verify_any(
-            &self.release_keys,
+        self.verify_any(
+            KeyRole::Release,
             MANIFEST_DOMAIN,
             bytes,
             signature,
@@ -176,23 +264,43 @@ impl TrustStore {
     pub(super) fn verify_artifact_message(
         &self,
         key_id: &str,
-        domain_separated_message: &[u8],
+        message: &[u8],
         signature: &[u8],
     ) -> Result<(), UpdateError> {
-        if !domain_separated_message.starts_with(ARTIFACT_DOMAIN) {
+        if !message.starts_with(ARTIFACT_DOMAIN) {
             return Err(UpdateError::BadSignature("release artifact"));
         }
-        let anchor = self
-            .release_keys
+        let key = self
+            .anchors
+            .active_key(KeyRole::Release, key_id, Utc::now())?;
+        verify_message(&key, message, signature, "release artifact")
+    }
+
+    fn verify_any(
+        &self,
+        role: KeyRole,
+        domain: &[u8],
+        bytes: &[u8],
+        signature: &[u8],
+        label: &'static str,
+    ) -> Result<String, UpdateError> {
+        let mut message = Vec::with_capacity(domain.len() + bytes.len());
+        message.extend_from_slice(domain);
+        message.extend_from_slice(bytes);
+        self.anchors
+            .keys
             .iter()
-            .find(|anchor| anchor.key_id == key_id)
-            .ok_or(UpdateError::BadSignature("release artifact"))?;
-        verify_signed_message(
-            anchor,
-            domain_separated_message,
-            signature,
-            "release artifact",
-        )
+            .filter(|entry| entry.role == role)
+            .find_map(|entry| {
+                let key = self
+                    .anchors
+                    .active_key(role, &entry.key_id, Utc::now())
+                    .ok()?;
+                verify_message(&key, &message, signature, label)
+                    .ok()
+                    .map(|()| entry.key_id.clone())
+            })
+            .ok_or(UpdateError::BadSignature(label))
     }
 
     pub(super) fn check_latest(
@@ -261,9 +369,9 @@ impl TrustStore {
     ) -> Result<(), UpdateError> {
         let (name, channel, platform) = statement.identity_key();
         let replacement = LatestFloor {
-            name: name.to_owned(),
-            channel: channel.to_owned(),
-            platform: platform.to_owned(),
+            name: name.into(),
+            channel: channel.into(),
+            platform: platform.into(),
             counter: statement.counter,
             statement_sha256: sha256_hex(bytes),
             version: statement.version.clone(),
@@ -285,52 +393,52 @@ impl TrustStore {
     }
 
     fn persist(&self) -> Result<(), UpdateError> {
-        let bytes = serde_json::to_vec(&self.state)?;
-        atomic_private_write(&self.directory, "trust-state.json", &bytes)
+        atomic_private_write(
+            &self.directory,
+            "trust-state.json",
+            &serde_json::to_vec(&self.state)?,
+        )
     }
 }
 
-fn verify_any(
-    anchors: &[Anchor],
-    domain: &[u8],
-    bytes: &[u8],
-    signature: &[u8],
-    label: &'static str,
-) -> Result<String, UpdateError> {
-    if signature.len() != 64 {
-        return Err(UpdateError::SignatureLength(label));
+fn root(key_id: &'static str, bytes: [u8; 32]) -> Result<RootAnchor, UpdateError> {
+    Ok(RootAnchor {
+        key_id,
+        key: VerifyingKey::from_bytes(&bytes).map_err(|error| {
+            UpdateError::Schema(format!("compiled placeholder root is invalid: {error}"))
+        })?,
+    })
+}
+
+fn online(role: KeyRole, key_id: &str, bytes: [u8; 32]) -> Result<OnlineKey, UpdateError> {
+    let key = VerifyingKey::from_bytes(&bytes).map_err(|error| {
+        UpdateError::Schema(format!(
+            "compiled placeholder online key is invalid: {error}"
+        ))
+    })?;
+    Ok(online_key(role, key_id, key))
+}
+
+fn online_key(role: KeyRole, key_id: &str, key: VerifyingKey) -> OnlineKey {
+    OnlineKey {
+        role,
+        key_id: key_id.into(),
+        public_key_base64: BASE64.encode(key.as_bytes()),
+        not_before: "2026-01-01T00:00:00Z".parse().expect("fixed timestamp"),
+        not_after: "2030-01-01T00:00:00Z".parse().expect("fixed timestamp"),
+        status: KeyStatus::Active,
     }
-    anchors
-        .iter()
-        .find(|anchor| verify_one(anchor, domain, bytes, signature, label).is_ok())
-        .map(|anchor| anchor.key_id.clone())
-        .ok_or(UpdateError::BadSignature(label))
 }
 
-fn verify_one(
-    anchor: &Anchor,
-    domain: &[u8],
-    bytes: &[u8],
-    signature: &[u8],
-    label: &'static str,
-) -> Result<(), UpdateError> {
-    let mut signed = Vec::with_capacity(domain.len() + bytes.len());
-    signed.extend_from_slice(domain);
-    signed.extend_from_slice(bytes);
-    verify_signed_message(anchor, &signed, signature, label)
-}
-
-fn verify_signed_message(
-    anchor: &Anchor,
-    signed: &[u8],
+fn verify_message(
+    key: &VerifyingKey,
+    message: &[u8],
     signature: &[u8],
     label: &'static str,
 ) -> Result<(), UpdateError> {
     let signature =
         Signature::from_slice(signature).map_err(|_| UpdateError::SignatureLength(label))?;
-    anchor
-        .key
-        .verify_strict(signed, &signature)
+    key.verify_strict(message, &signature)
         .map_err(|_| UpdateError::BadSignature(label))
 }
 

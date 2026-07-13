@@ -19,7 +19,7 @@ use super::{
     CliName, InstalledRelease, UpdateError, UpdateRequest, VerifiedArtifact,
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Receipt {
     schema: String,
@@ -35,6 +35,63 @@ pub(super) struct Receipt {
     latest_counter: Option<u64>,
     latest_statement_sha256: Option<String>,
     promotion_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingTransition {
+    schema: String,
+    kind: TransitionKind,
+    candidate: Receipt,
+    previous: Option<Receipt>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TransitionKind {
+    Update,
+    Rollback,
+}
+
+impl PendingTransition {
+    fn new(kind: TransitionKind, candidate: Receipt, previous: Option<Receipt>) -> Self {
+        Self {
+            schema: "tana.install-transition.v1".into(),
+            kind,
+            candidate,
+            previous,
+        }
+    }
+
+    fn validate(&self, request: &UpdateRequest) -> Result<(), UpdateError> {
+        if self.schema != "tana.install-transition.v1"
+            || !self.candidate.matches_request(request)
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|receipt| !receipt.matches_request(request))
+        {
+            return Err(UpdateError::Freshness(
+                "pending transition identity/schema is invalid".into(),
+            ));
+        }
+        if self.kind == TransitionKind::Update {
+            let Some(previous) = &self.previous else {
+                return Ok(());
+            };
+            if self.candidate.anchor_generation < previous.anchor_generation
+                || matches!(
+                    (self.candidate.latest_counter, previous.latest_counter),
+                    (Some(candidate), Some(prior)) if candidate < prior
+                )
+            {
+                return Err(UpdateError::Freshness(
+                    "pending transition lowers trust generation/counter".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Receipt {
@@ -117,32 +174,30 @@ impl AtomicInstaller {
         request: &UpdateRequest,
     ) -> Result<Option<InstalledRelease>, UpdateError> {
         let paths = InstallPaths::new(&request.install_path)?;
-        let Some(pending) = read_optional_receipt(&paths.pending_receipt)? else {
+        let Some(pending) = read_optional_transition(&paths.pending_receipt)? else {
             return Ok(None);
         };
-        if !pending.matches_request(request) {
-            return Err(UpdateError::Freshness(
-                "pending receipt identity differs from update request".into(),
-            ));
-        }
-        if verified_file(&request.install_path, &pending)?
+        pending.validate(request)?;
+        if verified_file(&request.install_path, &pending.candidate)?
             && self.health_check(&request.install_path).is_ok()
         {
-            atomic_private_write(
-                &paths.state_dir,
-                paths.current_receipt_name(),
-                &serde_json::to_vec(&pending)?,
-            )?;
-            append_receipt(&paths.receipt_log, &pending)?;
-            remove_if_exists(&paths.pending_receipt)?;
-            sync_directory(&paths.state_dir)?;
-            return Ok(Some(pending.installed(false)));
+            self.finalize_transition(&paths, &pending)?;
+            return Ok(Some(
+                pending
+                    .candidate
+                    .installed(pending.kind == TransitionKind::Rollback),
+            ));
         }
-        if self.restore_previous(&paths, &request.install_path)? {
-            append_receipt(&paths.failed_log, &pending)?;
+        if let Some(previous) = &pending.previous {
+            if verified_file(&request.install_path, previous)? {
+                // The process stopped before the swap. The official path is
+                // still the locally receipted current generation.
+                self.discard_transition(&paths)?;
+                return Ok(None);
+            }
         }
-        remove_if_exists(&paths.pending_receipt)?;
-        sync_directory(&paths.state_dir)?;
+        self.reject_candidate(&paths, &request.install_path, &pending)?;
+        append_receipt(&paths.failed_log, &pending.candidate)?;
         Ok(None)
     }
 
@@ -166,13 +221,13 @@ impl AtomicInstaller {
         }
         staged.as_file().sync_all()?;
 
+        let previous = self.stage_current(&paths, &install_path)?;
+        let transition = PendingTransition::new(TransitionKind::Update, receipt.clone(), previous);
         atomic_private_write(
             &paths.state_dir,
             paths.pending_receipt_name(),
-            &serde_json::to_vec(&receipt)?,
+            &serde_json::to_vec(&transition)?,
         )?;
-
-        self.back_up_current(&paths, &install_path)?;
         sync_directory(&paths.parent)?;
 
         staged
@@ -181,26 +236,11 @@ impl AtomicInstaller {
         sync_directory(&paths.parent)?;
 
         if let Err(error) = self.health_check(&install_path) {
+            self.reject_candidate(&paths, &install_path, &transition)?;
             append_receipt(&paths.failed_log, &receipt)?;
-            let restored = self.restore_previous(&paths, &install_path)?;
-            remove_if_exists(&paths.pending_receipt)?;
-            sync_directory(&paths.state_dir)?;
-            if !restored {
-                return Err(UpdateError::Health(format!(
-                    "{error}; no verified previous generation was available"
-                )));
-            }
             return Err(UpdateError::Health(error));
         }
-
-        atomic_private_write(
-            &paths.state_dir,
-            paths.current_receipt_name(),
-            &serde_json::to_vec(&receipt)?,
-        )?;
-        append_receipt(&paths.receipt_log, &receipt)?;
-        remove_if_exists(&paths.pending_receipt)?;
-        sync_directory(&paths.state_dir)?;
+        self.finalize_transition(&paths, &transition)?;
         Ok(receipt.installed(false))
     }
 
@@ -227,54 +267,47 @@ impl AtomicInstaller {
             ));
         }
 
-        let saved_current = paths.parent.join(format!(
-            ".{}.rollback-current",
-            paths.file_name.to_string_lossy()
-        ));
-        remove_if_exists(&saved_current)?;
-        link_or_verified_copy(install_path, &saved_current, &current.binary_sha256)?;
-        fs::rename(&paths.previous_binary, install_path)?;
-        fs::rename(&saved_current, &paths.previous_binary)?;
+        remove_if_exists(&paths.rollback_candidate)?;
+        link_or_verified_copy(
+            &paths.previous_binary,
+            &paths.rollback_candidate,
+            &previous.binary_sha256,
+        )?;
+        let staged_current = self.stage_current(&paths, install_path)?;
+        if staged_current.as_ref() != Some(&current) {
+            return Err(UpdateError::Rollback(
+                "current receipt changed while staging rollback".into(),
+            ));
+        }
+        let transition =
+            PendingTransition::new(TransitionKind::Rollback, previous.clone(), Some(current));
+        atomic_private_write(
+            &paths.state_dir,
+            paths.pending_receipt_name(),
+            &serde_json::to_vec(&transition)?,
+        )?;
+        fs::rename(&paths.rollback_candidate, install_path)?;
         sync_directory(&paths.parent)?;
 
         if let Err(error) = self.health_check(install_path) {
-            let failed_previous = paths.parent.join(format!(
-                ".{}.rollback-failed",
-                paths.file_name.to_string_lossy()
-            ));
-            remove_if_exists(&failed_previous)?;
-            fs::rename(install_path, &failed_previous)?;
-            fs::rename(&paths.previous_binary, install_path)?;
-            remove_if_exists(&failed_previous)?;
-            sync_directory(&paths.parent)?;
+            self.reject_candidate(&paths, install_path, &transition)?;
+            append_receipt(&paths.failed_log, &previous)?;
             return Err(UpdateError::Health(format!(
                 "rollback target failed self-test: {error}"
             )));
         }
-
-        atomic_private_write(
-            &paths.state_dir,
-            paths.current_receipt_name(),
-            &serde_json::to_vec(&previous)?,
-        )?;
-        atomic_private_write(
-            &paths.state_dir,
-            paths.previous_receipt_name(),
-            &serde_json::to_vec(&current)?,
-        )?;
-        append_receipt(&paths.receipt_log, &previous)?;
+        self.finalize_transition(&paths, &transition)?;
         Ok(previous.installed(true))
     }
 
-    fn back_up_current(
+    fn stage_current(
         &self,
         paths: &InstallPaths,
         install_path: &Path,
-    ) -> Result<(), UpdateError> {
+    ) -> Result<Option<Receipt>, UpdateError> {
+        remove_if_exists(&paths.transition_previous)?;
         if !install_path.exists() {
-            remove_if_exists(&paths.previous_binary)?;
-            remove_if_exists(&paths.previous_receipt)?;
-            return Ok(());
+            return Ok(None);
         }
         let current = read_optional_receipt(&paths.current_receipt)?.ok_or_else(|| {
             UpdateError::Digest(format!(
@@ -287,44 +320,96 @@ impl AtomicInstaller {
                 "current installation differs from its verified receipt".into(),
             ));
         }
-        let temporary = paths.parent.join(format!(
-            ".{}.prev-pending",
-            paths.file_name.to_string_lossy()
-        ));
-        remove_if_exists(&temporary)?;
-        link_or_verified_copy(install_path, &temporary, &current.binary_sha256)?;
-        fs::rename(&temporary, &paths.previous_binary)?;
-        atomic_private_write(
-            &paths.state_dir,
-            paths.previous_receipt_name(),
-            &serde_json::to_vec(&current)?,
+        link_or_verified_copy(
+            install_path,
+            &paths.transition_previous,
+            &current.binary_sha256,
         )?;
         sync_directory(&paths.parent)?;
-        Ok(())
+        Ok(Some(current))
     }
 
-    fn restore_previous(
+    fn reject_candidate(
         &self,
         paths: &InstallPaths,
         install_path: &Path,
-    ) -> Result<bool, UpdateError> {
-        let Some(previous) = read_optional_receipt(&paths.previous_receipt)? else {
-            return Ok(false);
-        };
-        if !verified_file(&paths.previous_binary, &previous)? {
-            return Err(UpdateError::Rollback(
-                "previous binary differs from its stored receipt".into(),
-            ));
+        transition: &PendingTransition,
+    ) -> Result<(), UpdateError> {
+        if let Some(previous) = &transition.previous {
+            let (recovery_path, consumed_previous_slot) =
+                if verified_file(&paths.transition_previous, previous)? {
+                    (&paths.transition_previous, false)
+                } else if verified_file(&paths.previous_binary, previous)? {
+                    (&paths.previous_binary, true)
+                } else {
+                    // Even with corrupt recovery material, never leave the rejected
+                    // candidate at the official executable path.
+                    quarantine_candidate(paths, install_path)?;
+                    return Err(UpdateError::Rollback(
+                        "transition previous binary differs from its receipt".into(),
+                    ));
+                };
+            quarantine_candidate(paths, install_path)?;
+            fs::rename(recovery_path, install_path)?;
+            if consumed_previous_slot {
+                remove_if_exists(&paths.previous_receipt)?;
+            }
+            atomic_private_write(
+                &paths.state_dir,
+                paths.current_receipt_name(),
+                &serde_json::to_vec(previous)?,
+            )?;
+        } else {
+            quarantine_candidate(paths, install_path)?;
+            remove_if_exists(&paths.current_receipt)?;
         }
-        fs::rename(&paths.previous_binary, install_path)?;
+        remove_if_exists(&paths.pending_receipt)?;
+        remove_if_exists(&paths.rollback_candidate)?;
+        sync_directory(&paths.parent)?;
+        sync_directory(&paths.state_dir)?;
+        Ok(())
+    }
+
+    fn finalize_transition(
+        &self,
+        paths: &InstallPaths,
+        transition: &PendingTransition,
+    ) -> Result<(), UpdateError> {
+        if let Some(previous) = &transition.previous {
+            if verified_file(&paths.transition_previous, previous)? {
+                fs::rename(&paths.transition_previous, &paths.previous_binary)?;
+            } else if !verified_file(&paths.previous_binary, previous)? {
+                return Err(UpdateError::Rollback(
+                    "cannot receipt an unverified previous generation".into(),
+                ));
+            }
+            atomic_private_write(
+                &paths.state_dir,
+                paths.previous_receipt_name(),
+                &serde_json::to_vec(previous)?,
+            )?;
+        } else {
+            remove_if_exists(&paths.previous_binary)?;
+            remove_if_exists(&paths.previous_receipt)?;
+        }
         atomic_private_write(
             &paths.state_dir,
             paths.current_receipt_name(),
-            &serde_json::to_vec(&previous)?,
+            &serde_json::to_vec(&transition.candidate)?,
         )?;
-        remove_if_exists(&paths.previous_receipt)?;
+        append_receipt(&paths.receipt_log, &transition.candidate)?;
+        remove_if_exists(&paths.rollback_candidate)?;
+        remove_if_exists(&paths.pending_receipt)?;
         sync_directory(&paths.parent)?;
-        Ok(true)
+        sync_directory(&paths.state_dir)?;
+        Ok(())
+    }
+
+    fn discard_transition(&self, paths: &InstallPaths) -> Result<(), UpdateError> {
+        remove_if_exists(&paths.transition_previous)?;
+        remove_if_exists(&paths.rollback_candidate)?;
+        remove_if_exists(&paths.pending_receipt)?;
+        sync_directory(&paths.state_dir)
     }
 
     fn health_check(&self, install_path: &Path) -> Result<(), String> {
@@ -384,11 +469,12 @@ impl Drop for InstallLock {
 
 struct InstallPaths {
     parent: PathBuf,
-    file_name: std::ffi::OsString,
     state_dir: PathBuf,
     current_receipt: PathBuf,
     previous_binary: PathBuf,
     previous_receipt: PathBuf,
+    transition_previous: PathBuf,
+    rollback_candidate: PathBuf,
     pending_receipt: PathBuf,
     receipt_log: PathBuf,
     failed_log: PathBuf,
@@ -408,10 +494,11 @@ impl InstallPaths {
         let state_dir = parent.join(format!(".{stem}.tana-update"));
         Ok(Self {
             parent: parent.clone(),
-            file_name,
             current_receipt: state_dir.join("current-receipt.json"),
             previous_binary: parent.join(format!("{stem}.prev")),
             previous_receipt: state_dir.join("previous-receipt.json"),
+            transition_previous: parent.join(format!(".{stem}.transition-previous")),
+            rollback_candidate: parent.join(format!(".{stem}.rollback-candidate")),
             pending_receipt: state_dir.join("pending-receipt.json"),
             receipt_log: state_dir.join("receipts.jsonl"),
             failed_log: state_dir.join("failed-receipts.jsonl"),
@@ -469,6 +556,32 @@ fn read_optional_receipt(path: &Path) -> Result<Option<Receipt>, UpdateError> {
     }
 }
 
+fn read_optional_transition(path: &Path) -> Result<Option<PendingTransition>, UpdateError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| UpdateError::Schema(format!("invalid pending transition: {error}"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn quarantine_candidate(paths: &InstallPaths, install_path: &Path) -> Result<(), UpdateError> {
+    if !install_path.exists() {
+        return Ok(());
+    }
+    let quarantine = paths.state_dir.join("failed-candidate.bin");
+    remove_if_exists(&quarantine)?;
+    fs::rename(install_path, &quarantine)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o600))?;
+    }
+    File::open(&quarantine)?.sync_all()?;
+    Ok(())
+}
+
 fn append_receipt(path: &Path, receipt: &Receipt) -> Result<(), UpdateError> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -519,3 +632,7 @@ fn sync_directory(path: &Path) -> Result<(), UpdateError> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "install_recovery_tests.rs"]
+mod recovery_tests;
