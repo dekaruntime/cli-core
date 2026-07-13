@@ -21,27 +21,26 @@ const MANIFEST_DOMAIN: &[u8] = b"tana.release-manifest.v1\n";
 pub(super) const ARTIFACT_DOMAIN: &[u8] = b"tana.release-artifact.v1\n";
 const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
 
-// PLACEHOLDER TRUST MATERIAL — NOT PRODUCTION HARAR KEYS.
-// Sami must replace and verify every root/online fingerprint out of band before
-// merge. A registry response can rotate/revoke online keys, never these roots.
-const PLACEHOLDER_HARAR_ROOT_A: [u8; 32] = [
-    102, 190, 126, 51, 44, 122, 69, 51, 50, 189, 157, 10, 127, 125, 176, 85, 245, 197, 239, 26, 6,
-    173, 166, 109, 152, 179, 159, 182, 129, 12, 71, 58,
+// PRE-MVP Ava-generated keys — MUST regenerate root offline with Sami before launch (tana#<pre-launch-issue>)
+// A registry response can rotate/revoke online keys, never these compiled roots.
+const HARAR_ROOT_A: [u8; 32] = [
+    0xa2, 0x92, 0x1c, 0xbc, 0xe9, 0xcc, 0x83, 0x03, 0xd3, 0xb3, 0xdb, 0xee, 0xc2, 0xb4, 0x5a, 0xbd,
+    0xf9, 0xb9, 0x13, 0x58, 0xb8, 0xbd, 0x0d, 0xcb, 0x22, 0x9c, 0xb6, 0x86, 0x7e, 0xfd, 0x73, 0xd4,
 ];
-const PLACEHOLDER_HARAR_ROOT_B: [u8; 32] = [
-    145, 162, 138, 11, 116, 56, 21, 147, 164, 217, 70, 149, 121, 32, 137, 38, 175, 200, 173, 130,
-    200, 131, 155, 118, 68, 53, 155, 158, 186, 154, 75, 58,
+const HARAR_ROOT_B: [u8; 32] = [
+    0x4d, 0x12, 0x0d, 0x6f, 0xf4, 0xe5, 0x0f, 0x9d, 0xec, 0x54, 0xb7, 0xf8, 0xd7, 0x42, 0xe2, 0xf3,
+    0x6f, 0x3d, 0x3f, 0x7f, 0x08, 0xac, 0xa4, 0x36, 0x35, 0xb5, 0xbb, 0x95, 0x4b, 0x19, 0xcf, 0x55,
 ];
-const PLACEHOLDER_HARAR_RELEASE_KEY: [u8; 32] = [
-    49, 200, 51, 252, 70, 230, 84, 255, 45, 19, 39, 128, 208, 236, 28, 1, 182, 147, 176, 124, 191,
-    197, 18, 190, 202, 27, 90, 145, 29, 170, 192, 142,
+const HARAR_RELEASE_KEY: [u8; 32] = [
+    0x73, 0xb7, 0x0f, 0xf8, 0x08, 0x3d, 0xe6, 0xd4, 0xe7, 0x28, 0x28, 0x00, 0x78, 0x43, 0x17, 0x5d,
+    0x50, 0x62, 0x84, 0x5a, 0x25, 0xbb, 0x0f, 0xb1, 0xd7, 0x7c, 0x0b, 0x0a, 0x11, 0xa6, 0xe5, 0x85,
 ];
-const PLACEHOLDER_HARAR_FRESHNESS_KEY: [u8; 32] = [
-    71, 144, 230, 106, 28, 64, 52, 115, 103, 182, 1, 11, 16, 235, 21, 221, 126, 250, 144, 82, 166,
-    2, 59, 57, 105, 217, 97, 222, 123, 159, 240, 223,
+const HARAR_FRESHNESS_KEY: [u8; 32] = [
+    0xd6, 0x42, 0xe5, 0xb1, 0x08, 0x18, 0x3d, 0x0e, 0x63, 0xdd, 0x7c, 0xc2, 0x2b, 0x0e, 0x3c, 0x62,
+    0x18, 0x64, 0xa9, 0xe4, 0xc1, 0x6d, 0xfc, 0x55, 0x9b, 0x2e, 0xe8, 0x5a, 0x49, 0x25, 0x2d, 0x90,
 ];
-const RELEASE_KEY_ID: &str = "PLACEHOLDER-harar-release-2026-q3";
-const FRESHNESS_KEY_ID: &str = "PLACEHOLDER-harar-freshness-2026-q3";
+const RELEASE_KEY_ID: &str = "harar-release-2026-preMVP";
+const FRESHNESS_KEY_ID: &str = "harar-freshness-2026-preMVP";
 const COMPILED_ANCHOR_GENERATION: u64 = 1;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -76,23 +75,15 @@ pub struct TrustStore {
 impl TrustStore {
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, UpdateError> {
         let roots = vec![
-            root("PLACEHOLDER-harar-root-a", PLACEHOLDER_HARAR_ROOT_A)?,
-            root("PLACEHOLDER-harar-root-b", PLACEHOLDER_HARAR_ROOT_B)?,
+            root("harar-root-a", HARAR_ROOT_A)?,
+            root("harar-root-b", HARAR_ROOT_B)?,
         ];
         let anchors = AnchorSet::compiled(
             COMPILED_ANCHOR_GENERATION,
             &roots,
             vec![
-                online(
-                    KeyRole::Release,
-                    RELEASE_KEY_ID,
-                    PLACEHOLDER_HARAR_RELEASE_KEY,
-                )?,
-                online(
-                    KeyRole::Freshness,
-                    FRESHNESS_KEY_ID,
-                    PLACEHOLDER_HARAR_FRESHNESS_KEY,
-                )?,
+                online(KeyRole::Release, RELEASE_KEY_ID, HARAR_RELEASE_KEY)?,
+                online(KeyRole::Freshness, FRESHNESS_KEY_ID, HARAR_FRESHNESS_KEY)?,
             ],
         );
         Self::open_with_material(directory.into(), roots, anchors)
@@ -126,7 +117,33 @@ impl TrustStore {
         freshness_key: VerifyingKey,
     ) -> Result<Self, UpdateError> {
         let roots = vec![RootAnchor {
-            key_id: "harar-root-test",
+            key_id: "harar-root-test".into(),
+            key: root_key,
+        }];
+        let anchors = AnchorSet::compiled(
+            1,
+            &roots,
+            vec![
+                online_key(KeyRole::Release, release_key_id, release_key),
+                online_key(KeyRole::Freshness, freshness_key_id, freshness_key),
+            ],
+        );
+        Self::open_with_material(directory, roots, anchors)
+    }
+
+    /// Constructs an isolated trust store for cross-process integration tests.
+    #[doc(hidden)]
+    pub fn with_testing_keys(
+        directory: PathBuf,
+        root_key_id: &'static str,
+        root_key: VerifyingKey,
+        release_key_id: &str,
+        release_key: VerifyingKey,
+        freshness_key_id: &str,
+        freshness_key: VerifyingKey,
+    ) -> Result<Self, UpdateError> {
+        let roots = vec![RootAnchor {
+            key_id: root_key_id.into(),
             key: root_key,
         }];
         let anchors = AnchorSet::compiled(
@@ -412,21 +429,17 @@ impl TrustStore {
     }
 }
 
-fn root(key_id: &'static str, bytes: [u8; 32]) -> Result<RootAnchor, UpdateError> {
+fn root(key_id: &str, bytes: [u8; 32]) -> Result<RootAnchor, UpdateError> {
     Ok(RootAnchor {
-        key_id,
-        key: VerifyingKey::from_bytes(&bytes).map_err(|error| {
-            UpdateError::Schema(format!("compiled placeholder root is invalid: {error}"))
-        })?,
+        key_id: key_id.into(),
+        key: VerifyingKey::from_bytes(&bytes)
+            .map_err(|error| UpdateError::Schema(format!("compiled root is invalid: {error}")))?,
     })
 }
 
 fn online(role: KeyRole, key_id: &str, bytes: [u8; 32]) -> Result<OnlineKey, UpdateError> {
-    let key = VerifyingKey::from_bytes(&bytes).map_err(|error| {
-        UpdateError::Schema(format!(
-            "compiled placeholder online key is invalid: {error}"
-        ))
-    })?;
+    let key = VerifyingKey::from_bytes(&bytes)
+        .map_err(|error| UpdateError::Schema(format!("compiled online key is invalid: {error}")))?;
     Ok(online_key(role, key_id, key))
 }
 

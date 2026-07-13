@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use super::{sha256_hex, UpdateError};
@@ -11,7 +11,7 @@ pub(super) const ANCHOR_DOMAIN: &[u8] = b"tana.anchor-set.v1\n";
 
 #[derive(Clone)]
 pub(super) struct RootAnchor {
-    pub key_id: &'static str,
+    pub key_id: String,
     pub key: VerifyingKey,
 }
 
@@ -61,14 +61,14 @@ pub(super) struct AnchorSet {
     pub keys: Vec<OnlineKey>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AnchorSignatures {
     schema: String,
     signatures: Vec<RootSignature>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RootSignature {
     key_id: String,
@@ -87,7 +87,7 @@ impl AnchorSet {
             roots: roots
                 .iter()
                 .map(|root| PublishedRoot {
-                    key_id: root.key_id.into(),
+                    key_id: root.key_id.clone(),
                     public_key_base64: BASE64.encode(root.key.as_bytes()),
                     fingerprint_sha256: sha256_hex(root.key.as_bytes()),
                 })
@@ -226,6 +226,88 @@ impl AnchorSet {
     }
 }
 
+/// Exact public anchor bytes and detached root signatures for initial provisioning.
+pub struct BootstrapAnchorSet {
+    pub anchor_set: Vec<u8>,
+    pub signatures: Vec<u8>,
+}
+
+/// Build generation 1 using the verifier's closed schema and sign its exact bytes.
+///
+/// This is intentionally a narrow ceremony API used by `harar-anchor-init`; private
+/// key file handling remains in that one-shot binary and key bytes are never logged.
+pub fn build_bootstrap_anchor_set(
+    root_a: &SigningKey,
+    root_b: &SigningKey,
+    release: &SigningKey,
+    freshness: &SigningKey,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<BootstrapAnchorSet, UpdateError> {
+    if issued_at >= expires_at {
+        return Err(UpdateError::Schema(
+            "anchor validity window must be positive".into(),
+        ));
+    }
+    let roots = vec![
+        RootAnchor {
+            key_id: "harar-root-a".into(),
+            key: root_a.verifying_key(),
+        },
+        RootAnchor {
+            key_id: "harar-root-b".into(),
+            key: root_b.verifying_key(),
+        },
+    ];
+    let mut set = AnchorSet::compiled(
+        1,
+        &roots,
+        vec![
+            OnlineKey {
+                role: KeyRole::Release,
+                key_id: "harar-release-2026-preMVP".into(),
+                public_key_base64: BASE64.encode(release.verifying_key().as_bytes()),
+                not_before: issued_at,
+                not_after: expires_at,
+                status: KeyStatus::Active,
+            },
+            OnlineKey {
+                role: KeyRole::Freshness,
+                key_id: "harar-freshness-2026-preMVP".into(),
+                public_key_base64: BASE64.encode(freshness.verifying_key().as_bytes()),
+                not_before: issued_at,
+                not_after: expires_at,
+                status: KeyStatus::Active,
+            },
+        ],
+    );
+    set.issued_at = issued_at;
+    set.expires_at = expires_at;
+    let anchor_set = serde_json::to_vec(&set)?;
+    let mut message = Vec::with_capacity(ANCHOR_DOMAIN.len() + anchor_set.len());
+    message.extend_from_slice(ANCHOR_DOMAIN);
+    message.extend_from_slice(&anchor_set);
+    let signatures = serde_json::to_vec(&AnchorSignatures {
+        schema: "tana.anchor-signatures.v1".into(),
+        signatures: vec![
+            RootSignature {
+                key_id: "harar-root-a".into(),
+                algorithm: "ed25519".into(),
+                signature_base64: BASE64.encode(root_a.sign(&message).to_bytes()),
+            },
+            RootSignature {
+                key_id: "harar-root-b".into(),
+                algorithm: "ed25519".into(),
+                signature_base64: BASE64.encode(root_b.sign(&message).to_bytes()),
+            },
+        ],
+    })?;
+    Ok(BootstrapAnchorSet {
+        anchor_set,
+        signatures,
+    })
+}
+
 impl KeyRole {
     fn label(self) -> &'static str {
         match self {
@@ -254,6 +336,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bootstrap_builder_emits_bytes_accepted_by_the_verifier() {
+        let root_a = SigningKey::from_bytes(&[51; 32]);
+        let root_b = SigningKey::from_bytes(&[52; 32]);
+        let release = SigningKey::from_bytes(&[53; 32]);
+        let freshness = SigningKey::from_bytes(&[54; 32]);
+        let issued_at = "2026-07-13T12:00:00Z".parse().unwrap();
+        let expires_at = "2027-07-13T12:00:00Z".parse().unwrap();
+        let output = build_bootstrap_anchor_set(
+            &root_a, &root_b, &release, &freshness, issued_at, expires_at,
+        )
+        .unwrap();
+        let roots = [
+            RootAnchor {
+                key_id: "harar-root-a".into(),
+                key: root_a.verifying_key(),
+            },
+            RootAnchor {
+                key_id: "harar-root-b".into(),
+                key: root_b.verifying_key(),
+            },
+        ];
+        let parsed = AnchorSet::parse_and_verify(
+            &output.anchor_set,
+            &output.signatures,
+            &roots,
+            1,
+            "2026-08-01T00:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed.generation, 1);
+        assert!(parsed
+            .keys
+            .iter()
+            .any(|key| key.key_id == "harar-release-2026-preMVP"));
+        assert!(parsed
+            .keys
+            .iter()
+            .any(|key| key.key_id == "harar-freshness-2026-preMVP"));
+    }
+
+    #[test]
     fn unknown_root_signer_does_not_help_meet_rotation_threshold() {
         let trusted_a = SigningKey::from_bytes(&[41; 32]);
         let trusted_b = SigningKey::from_bytes(&[42; 32]);
@@ -261,11 +384,11 @@ mod tests {
         let online = SigningKey::from_bytes(&[44; 32]);
         let roots = [
             RootAnchor {
-                key_id: "trusted-root-a",
+                key_id: "trusted-root-a".into(),
                 key: trusted_a.verifying_key(),
             },
             RootAnchor {
-                key_id: "trusted-root-b",
+                key_id: "trusted-root-b".into(),
                 key: trusted_b.verifying_key(),
             },
         ];

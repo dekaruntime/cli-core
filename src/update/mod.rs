@@ -35,6 +35,7 @@ use self::{
 pub use http_transport::HttpReleaseTransport;
 pub use install::AtomicInstaller;
 pub use trust::TrustStore;
+pub use trust_anchor::{build_bootstrap_anchor_set, BootstrapAnchorSet};
 pub use verified::VerifiedArtifact;
 
 const MAX_LATEST_BYTES: usize = 16 * 1024;

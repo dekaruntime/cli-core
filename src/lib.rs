@@ -10,8 +10,9 @@ pub mod whoami;
 
 pub use token_file::{SecretToken, TokenStore};
 pub use update::{
-    verify_and_install, AtomicInstaller, CliName, HttpReleaseTransport, InstalledRelease,
-    ReleaseChannel, ReleaseCoordinates, ReleaseTransport, TargetTriple, TransportError, TrustStore,
-    UpdateError, UpdateRequest, VerifiedArtifact, VersionSelector,
+    build_bootstrap_anchor_set, verify_and_install, AtomicInstaller, BootstrapAnchorSet, CliName,
+    HttpReleaseTransport, InstalledRelease, ReleaseChannel, ReleaseCoordinates, ReleaseTransport,
+    TargetTriple, TransportError, TrustStore, UpdateError, UpdateRequest, VerifiedArtifact,
+    VersionSelector,
 };
 pub use whoami::{Identity, LinkhashClient, Principal};

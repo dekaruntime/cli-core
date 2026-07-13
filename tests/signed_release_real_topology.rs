@@ -21,12 +21,10 @@ use tana_cli_core::{
     UpdateRequest, VersionSelector,
 };
 
-const ROOT_A_ID: &str = "PLACEHOLDER-harar-root-a";
-const ROOT_B_ID: &str = "PLACEHOLDER-harar-root-b";
+const ROOT_A_ID: &str = "harar-root-a";
 const RELEASE_ID: &str = "topology-release-key";
 const FRESHNESS_ID: &str = "topology-freshness-key";
 const ANCHOR_DOMAIN: &[u8] = b"tana.anchor-set.v1\n";
-const LINKHASH_ANCHOR_DOMAIN: &[u8] = b"tana.release-anchor-set.v1\n";
 const MANIFEST_DOMAIN: &[u8] = b"tana.release-manifest.v1\n";
 const ARTIFACT_DOMAIN: &[u8] = b"tana.release-artifact.v1\n";
 const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
@@ -37,6 +35,9 @@ struct Fixture {
     transport: LinkhashProducerTransport,
     artifact_path: PathBuf,
     expected_binary: Vec<u8>,
+    root_key: ed25519_dalek::VerifyingKey,
+    release_key: ed25519_dalek::VerifyingKey,
+    freshness_key: ed25519_dalek::VerifyingKey,
 }
 
 impl Drop for Fixture {
@@ -52,7 +53,6 @@ impl Fixture {
         let release = SigningKey::from_bytes(&[31; 32]);
         let freshness = SigningKey::from_bytes(&[32; 32]);
         let root_a = SigningKey::from_bytes(&[11; 32]);
-        let root_b = SigningKey::from_bytes(&[13; 32]);
         let binary = b"#!/bin/sh\n# real topology signed artifact\nexit 0\n".to_vec();
         let artifact = zstd::stream::encode_all(Cursor::new(&binary), 7).unwrap();
         let artifact_name = "deka-1.8.0-x86_64-unknown-linux-musl.zst";
@@ -107,7 +107,7 @@ impl Fixture {
             "issued_at": "2026-01-01T00:00:00Z",
             "expires_at": "2030-01-01T00:00:00Z",
             "threshold": 1,
-            "roots": [root_entry(ROOT_A_ID, &root_a), root_entry(ROOT_B_ID, &root_b)],
+            "roots": [root_entry(ROOT_A_ID, &root_a)],
             "keys": [
                 key_entry("release", RELEASE_ID, &release),
                 key_entry("freshness", FRESHNESS_ID, &freshness)
@@ -158,28 +158,29 @@ impl Fixture {
         );
 
         let linkhash_anchor = serde_json::to_vec(&json!({
-            "schema": "tana.release-anchor-set.v1",
-            "algorithm": "ed25519",
+            "schema": "tana.anchor-set.v1",
             "generation": 1,
-            "release_keys": [{
-                "key_id": RELEASE_ID,
-                "public_key_base64": BASE64.encode(release.verifying_key().as_bytes())
-            }],
-            "freshness_keys": [{
-                "key_id": FRESHNESS_ID,
-                "public_key_base64": BASE64.encode(freshness.verifying_key().as_bytes())
-            }],
-            "revoked_key_ids": []
+            "issued_at": "2026-01-01T00:00:00Z",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "threshold": 1,
+            "roots": [root_entry(ROOT_A_ID, &root_a)],
+            "keys": [
+                key_entry("release", RELEASE_ID, &release),
+                key_entry("freshness", FRESHNESS_ID, &freshness)
+            ]
         }))
         .unwrap();
         let linkhash_anchor_path = root.path().join("linkhash-anchor.json");
         let linkhash_anchor_sig_path = root.path().join("linkhash-anchor.sig");
         fs::write(&linkhash_anchor_path, &linkhash_anchor).unwrap();
-        fs::write(
-            &linkhash_anchor_sig_path,
-            sign(&root_a, LINKHASH_ANCHOR_DOMAIN, &linkhash_anchor),
-        )
-        .unwrap();
+        fs::write(&linkhash_anchor_sig_path, serde_json::to_vec(&json!({
+            "schema": "tana.anchor-signatures.v1",
+            "signatures": [{
+                "key_id": ROOT_A_ID,
+                "algorithm": "ed25519",
+                "signature_base64": BASE64.encode(sign(&root_a, ANCHOR_DOMAIN, &linkhash_anchor))
+            }]
+        })).unwrap()).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -210,7 +211,7 @@ impl Fixture {
                 &linkhash_anchor_sig_path,
             )
             .env(
-                "TANA_RELEASE_OFFLINE_ROOT_PUBLIC_KEY",
+                "TANA_RELEASE_TEST_ROOT_PUBLIC_KEY",
                 BASE64.encode(root_a.verifying_key().as_bytes()),
             )
             .stdout(Stdio::null())
@@ -229,6 +230,9 @@ impl Fixture {
             transport,
             artifact_path,
             expected_binary: binary,
+            root_key: root_a.verifying_key(),
+            release_key: release.verifying_key(),
+            freshness_key: freshness.verifying_key(),
         }
     }
 
@@ -242,6 +246,19 @@ impl Fixture {
             },
             install_path: self.root.path().join(format!("install/{suffix}/deka")),
         }
+    }
+
+    fn trust(&self, suffix: &str) -> TrustStore {
+        TrustStore::with_testing_keys(
+            self.root.path().join(suffix),
+            ROOT_A_ID,
+            self.root_key,
+            RELEASE_ID,
+            self.release_key,
+            FRESHNESS_ID,
+            self.freshness_key,
+        )
+        .unwrap()
     }
 }
 
@@ -319,7 +336,7 @@ fn client_verifies_real_linkhash_producer_across_process_boundary() {
     let fixture = Fixture::start();
     let request = fixture.request("valid");
     let install_path = request.install_path.clone();
-    let mut trust = TrustStore::open(fixture.root.path().join("trust-valid")).unwrap();
+    let mut trust = fixture.trust("trust-valid");
     let installed = verify_and_install(
         request,
         &fixture.transport,
@@ -340,7 +357,7 @@ fn real_linkhash_process_artifact_tamper_never_reaches_install_path() {
     fs::write(&fixture.artifact_path, tampered).unwrap();
     let request = fixture.request("tampered");
     let install_path = request.install_path.clone();
-    let mut trust = TrustStore::open(fixture.root.path().join("trust-tampered")).unwrap();
+    let mut trust = fixture.trust("trust-tampered");
     let error = verify_and_install(
         request,
         &fixture.transport,
