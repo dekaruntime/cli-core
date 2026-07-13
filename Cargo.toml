@@ -6,11 +6,16 @@ description = "Shared Tana CLI primitives for auth token storage and linkhash id
 
 [dependencies]
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+ed25519-dalek = "2"
+fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
+semver = { version = "1", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3"
 thiserror = "1.0"
 tokio = { version = "1", features = ["fs"] }
-
-[dev-dependencies]
-tempfile = "3"
+zstd = "0.13"
+zstd-safe = "7"
