@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::{
-    fs,
+    env, fs,
     io::Cursor,
     net::TcpListener,
     path::{Path, PathBuf},
@@ -17,7 +17,8 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use tana_cli_core::{
     verify_and_install, AtomicInstaller, CliName, HttpReleaseTransport, ReleaseChannel,
-    TargetTriple, TrustStore, UpdateError, UpdateRequest, VersionSelector,
+    ReleaseCoordinates, ReleaseTransport, TargetTriple, TransportError, TrustStore, UpdateError,
+    UpdateRequest, VersionSelector,
 };
 
 const ROOT_A_ID: &str = "PLACEHOLDER-harar-root-a";
@@ -25,6 +26,7 @@ const ROOT_B_ID: &str = "PLACEHOLDER-harar-root-b";
 const RELEASE_ID: &str = "topology-release-key";
 const FRESHNESS_ID: &str = "topology-freshness-key";
 const ANCHOR_DOMAIN: &[u8] = b"tana.anchor-set.v1\n";
+const LINKHASH_ANCHOR_DOMAIN: &[u8] = b"tana.release-anchor-set.v1\n";
 const MANIFEST_DOMAIN: &[u8] = b"tana.release-manifest.v1\n";
 const ARTIFACT_DOMAIN: &[u8] = b"tana.release-artifact.v1\n";
 const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
@@ -32,7 +34,7 @@ const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
 struct Fixture {
     root: tempfile::TempDir,
     server: Child,
-    origin: String,
+    transport: LinkhashProducerTransport,
     artifact_path: PathBuf,
     expected_binary: Vec<u8>,
 }
@@ -98,16 +100,14 @@ impl Fixture {
             "expires_at": (issued + ChronoDuration::hours(72)).to_rfc3339_opts(SecondsFormat::Secs, true)
         }))
         .unwrap();
+
         let anchor_set = serde_json::to_vec(&json!({
             "schema": "tana.anchor-set.v1",
             "generation": 2,
             "issued_at": "2026-01-01T00:00:00Z",
             "expires_at": "2030-01-01T00:00:00Z",
             "threshold": 1,
-            "roots": [
-                root_entry(ROOT_A_ID, &root_a),
-                root_entry(ROOT_B_ID, &root_b)
-            ],
+            "roots": [root_entry(ROOT_A_ID, &root_a), root_entry(ROOT_B_ID, &root_b)],
             "keys": [
                 key_entry("release", RELEASE_ID, &release),
                 key_entry("freshness", FRESHNESS_ID, &freshness)
@@ -124,69 +124,109 @@ impl Fixture {
         }))
         .unwrap();
 
+        let store_path = root.path().join("store");
+        let data_path = root.path().join("data");
+        let config_path = data_path.join("config/linkhash.toml");
+        initialize_linkhash(&store_path, &data_path, &config_path);
+        let releases_path = root.path().join("releases");
+        let immutable =
+            releases_path.join("production/deka/stable/1.8.0/x86_64-unknown-linux-musl");
+        write(&immutable, "release-manifest.json", &manifest);
         write(
-            root.path(),
-            "api/v1/releases/trust/anchor-set.json",
-            &anchor_set,
-        );
-        write(
-            root.path(),
-            "api/v1/releases/trust/anchor-set.sig",
-            &anchor_signatures,
-        );
-        let live = "api/v1/releases/deka/stable/x86_64-unknown-linux-musl";
-        write(root.path(), &format!("{live}/latest.json"), &latest);
-        write(
-            root.path(),
-            &format!("{live}/latest.sig"),
-            &sign(&freshness, LATEST_DOMAIN, &latest),
-        );
-        let immutable = "api/v1/releases/deka/stable/1.8.0/x86_64-unknown-linux-musl";
-        write(
-            root.path(),
-            &format!("{immutable}/release-manifest.json"),
-            &manifest,
-        );
-        write(
-            root.path(),
-            &format!("{immutable}/release-manifest.sig"),
+            &immutable,
+            "release-manifest.sig",
             &sign(&release, MANIFEST_DOMAIN, &manifest),
         );
-        let artifact_path = root.path().join(immutable).join(artifact_name);
+        let artifact_path = immutable.join(artifact_name);
+        write(&immutable, artifact_name, &artifact);
         write(
-            root.path(),
-            &format!("{immutable}/{artifact_name}"),
-            &artifact,
-        );
-        write(
-            root.path(),
-            &format!("{immutable}/{artifact_name}.sig"),
+            &immutable,
+            &format!("{artifact_name}.sig"),
             &sign(&release, ARTIFACT_DOMAIN, &artifact),
         );
+        let latest_dir = releases_path.join("latest/deka/stable/x86_64-unknown-linux-musl/1");
+        write(&latest_dir, "latest.json", &latest);
+        write(
+            &latest_dir,
+            "latest.sig",
+            &sign(&freshness, LATEST_DOMAIN, &latest),
+        );
+        write(
+            &releases_path.join("latest/deka/stable/x86_64-unknown-linux-musl"),
+            "current",
+            b"1",
+        );
+
+        let linkhash_anchor = serde_json::to_vec(&json!({
+            "schema": "tana.release-anchor-set.v1",
+            "algorithm": "ed25519",
+            "generation": 1,
+            "release_keys": [{
+                "key_id": RELEASE_ID,
+                "public_key_base64": BASE64.encode(release.verifying_key().as_bytes())
+            }],
+            "freshness_keys": [{
+                "key_id": FRESHNESS_ID,
+                "public_key_base64": BASE64.encode(freshness.verifying_key().as_bytes())
+            }],
+            "revoked_key_ids": []
+        }))
+        .unwrap();
+        let linkhash_anchor_path = root.path().join("linkhash-anchor.json");
+        let linkhash_anchor_sig_path = root.path().join("linkhash-anchor.sig");
+        fs::write(&linkhash_anchor_path, &linkhash_anchor).unwrap();
+        fs::write(
+            &linkhash_anchor_sig_path,
+            sign(&root_a, LINKHASH_ANCHOR_DOMAIN, &linkhash_anchor),
+        )
+        .unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let server = Command::new("python3")
-            .args([
-                "-m",
-                "http.server",
-                &port.to_string(),
-                "--bind",
-                "127.0.0.1",
-                "--directory",
-                root.path().to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
         let origin = format!("http://127.0.0.1:{port}");
+        let server = Command::new(linkhash_binary())
+            .args(["start", "api", "--bind", &format!("127.0.0.1:{port}")])
+            .env("LINKHASH_STORE_PATH", &store_path)
+            .env("LINKHASH_AUTH_SECRET", "real-topology-auth-secret-32-bytes")
+            .env("LINKHASH_AUTH_ISSUER", "real-topology")
+            .env("LINKHASH_AUTH_AUDIENCE", "linkhash")
+            .env("LINKHASH_RELEASE_STORAGE_PATH", &releases_path)
+            .env("LINKHASH_RELEASE_HARAR_URL", &origin)
+            .env("LINKHASH_RELEASE_TRANSPARENCY_URL", &origin)
+            .env("LINKHASH_RELEASE_INTERNAL_URL", &origin)
+            .env(
+                "HARAR_RELEASE_PUBLIC_KEYS",
+                json!({RELEASE_ID: BASE64.encode(release.verifying_key().as_bytes())}).to_string(),
+            )
+            .env(
+                "HARAR_FRESHNESS_PUBLIC_KEYS",
+                json!({FRESHNESS_ID: BASE64.encode(freshness.verifying_key().as_bytes())})
+                    .to_string(),
+            )
+            .env("LINKHASH_RELEASE_ANCHOR_SET_PATH", &linkhash_anchor_path)
+            .env(
+                "LINKHASH_RELEASE_ANCHOR_SET_SIGNATURE_PATH",
+                &linkhash_anchor_sig_path,
+            )
+            .env(
+                "TANA_RELEASE_OFFLINE_ROOT_PUBLIC_KEY",
+                BASE64.encode(root_a.verifying_key().as_bytes()),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the real Linkhash API binary");
         wait_ready(&origin);
+        let transport = LinkhashProducerTransport {
+            http: HttpReleaseTransport::new(&origin, Duration::from_secs(3)).unwrap(),
+            anchor_set,
+            anchor_signatures,
+        };
         Self {
             root,
             server,
-            origin,
+            transport,
             artifact_path,
             expected_binary: binary,
         }
@@ -205,33 +245,138 @@ impl Fixture {
     }
 }
 
+struct LinkhashProducerTransport {
+    http: HttpReleaseTransport,
+    anchor_set: Vec<u8>,
+    anchor_signatures: Vec<u8>,
+}
+
+impl ReleaseTransport for LinkhashProducerTransport {
+    fn fetch_anchor_set(&self, max_bytes: usize) -> Result<Vec<u8>, TransportError> {
+        bounded_clone(&self.anchor_set, max_bytes)
+    }
+
+    fn fetch_anchor_signatures(&self, max_bytes: usize) -> Result<Vec<u8>, TransportError> {
+        bounded_clone(&self.anchor_signatures, max_bytes)
+    }
+
+    fn fetch_latest_statement(
+        &self,
+        name: &str,
+        channel: &str,
+        platform: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.http
+            .fetch_latest_statement(name, channel, platform, max_bytes)
+    }
+
+    fn fetch_latest_signature(
+        &self,
+        name: &str,
+        channel: &str,
+        platform: &str,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.http.fetch_latest_signature(name, channel, platform)
+    }
+
+    fn fetch_manifest(
+        &self,
+        release: ReleaseCoordinates<'_>,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.http.fetch_manifest(release, max_bytes)
+    }
+
+    fn fetch_manifest_signature(
+        &self,
+        release: ReleaseCoordinates<'_>,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.http.fetch_manifest_signature(release)
+    }
+
+    fn fetch_artifact(
+        &self,
+        release: ReleaseCoordinates<'_>,
+        artifact: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.http.fetch_artifact(release, artifact, max_bytes)
+    }
+
+    fn fetch_artifact_signature(
+        &self,
+        release: ReleaseCoordinates<'_>,
+        artifact: &str,
+    ) -> Result<Vec<u8>, TransportError> {
+        self.http.fetch_artifact_signature(release, artifact)
+    }
+}
+
 #[test]
-fn client_verifies_real_signed_artifact_across_http_process_boundary() {
+#[ignore = "requires LINKHASH_REAL_BINARY built from the signed-release producer branch"]
+fn client_verifies_real_linkhash_producer_across_process_boundary() {
     let fixture = Fixture::start();
     let request = fixture.request("valid");
     let install_path = request.install_path.clone();
-    let transport = HttpReleaseTransport::new(&fixture.origin, Duration::from_secs(3)).unwrap();
     let mut trust = TrustStore::open(fixture.root.path().join("trust-valid")).unwrap();
-    let installed =
-        verify_and_install(request, &transport, &AtomicInstaller::default(), &mut trust).unwrap();
+    let installed = verify_and_install(
+        request,
+        &fixture.transport,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap();
     assert_eq!(installed.version().to_string(), "1.8.0");
     assert_eq!(fs::read(install_path).unwrap(), fixture.expected_binary);
 }
 
 #[test]
-fn process_boundary_artifact_tamper_never_reaches_install_path() {
+#[ignore = "requires LINKHASH_REAL_BINARY built from the signed-release producer branch"]
+fn real_linkhash_process_artifact_tamper_never_reaches_install_path() {
     let fixture = Fixture::start();
     let mut tampered = fs::read(&fixture.artifact_path).unwrap();
     tampered[2] ^= 0x80;
     fs::write(&fixture.artifact_path, tampered).unwrap();
     let request = fixture.request("tampered");
     let install_path = request.install_path.clone();
-    let transport = HttpReleaseTransport::new(&fixture.origin, Duration::from_secs(3)).unwrap();
     let mut trust = TrustStore::open(fixture.root.path().join("trust-tampered")).unwrap();
-    let error = verify_and_install(request, &transport, &AtomicInstaller::default(), &mut trust)
-        .unwrap_err();
+    let error = verify_and_install(
+        request,
+        &fixture.transport,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap_err();
     assert!(matches!(error, UpdateError::Digest(_)));
     assert!(!install_path.exists());
+}
+
+fn initialize_linkhash(store: &Path, data: &Path, config: &Path) {
+    let status = Command::new(linkhash_binary())
+        .args(["server", "init"])
+        .env("LINKHASH_STORE_PATH", store)
+        .env("LINKHASH_DATA_DIR", data)
+        .env("LINKHASH_CONFIG_PATH", config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("run the real Linkhash store initializer");
+    assert!(status.success(), "Linkhash store initialization failed");
+}
+
+fn linkhash_binary() -> PathBuf {
+    env::var_os("LINKHASH_REAL_BINARY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .expect("LINKHASH_REAL_BINARY must name the real linkhash binary from producer PR #136")
+}
+
+fn bounded_clone(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, TransportError> {
+    if bytes.len() > max_bytes {
+        return Err(TransportError::new("release response exceeds byte limit"));
+    }
+    Ok(bytes.to_vec())
 }
 
 fn root_entry(id: &str, key: &SigningKey) -> serde_json::Value {
@@ -272,12 +417,12 @@ fn write(root: &Path, relative: &str, bytes: &[u8]) {
 }
 
 fn wait_ready(origin: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if reqwest::blocking::get(origin).is_ok() {
+        if reqwest::blocking::get(format!("{origin}/healthz")).is_ok() {
             return;
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(50));
     }
-    panic!("real-topology fixture did not become ready");
+    panic!("real Linkhash producer did not become ready");
 }

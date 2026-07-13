@@ -100,6 +100,7 @@ impl AnchorSet {
         bytes: &[u8],
         signature_bytes: &[u8],
         roots: &[RootAnchor],
+        trusted_threshold: u8,
         now: DateTime<Utc>,
     ) -> Result<Self, UpdateError> {
         let set: Self = serde_json::from_slice(bytes)
@@ -114,7 +115,11 @@ impl AnchorSet {
                 "anchor set is not currently valid".into(),
             ));
         }
-        if set.threshold == 0 || usize::from(set.threshold) > roots.len() {
+        if set.threshold == 0
+            || usize::from(set.threshold) > roots.len()
+            || trusted_threshold == 0
+            || usize::from(trusted_threshold) > roots.len()
+        {
             return Err(UpdateError::Schema("anchor threshold is invalid".into()));
         }
         set.validate_roots(roots)?;
@@ -132,7 +137,7 @@ impl AnchorSet {
         message.extend_from_slice(bytes);
         let mut valid = HashSet::new();
         for item in signatures.signatures {
-            if item.algorithm != "ed25519" || !valid.insert(item.key_id.clone()) {
+            if item.algorithm != "ed25519" || valid.contains(&item.key_id) {
                 continue;
             }
             let Some(root) = roots.iter().find(|root| root.key_id == item.key_id) else {
@@ -144,14 +149,18 @@ impl AnchorSet {
             let Ok(signature) = Signature::from_slice(&raw) else {
                 continue;
             };
-            if root.key.verify_strict(&message, &signature).is_err() {
-                valid.remove(&item.key_id);
+            if root.key.verify_strict(&message, &signature).is_ok() {
+                valid.insert(item.key_id);
             }
         }
-        if valid.len() < usize::from(set.threshold) {
+        if valid.len() < usize::from(trusted_threshold) {
             return Err(UpdateError::BadSignature("anchor set"));
         }
         Ok(set)
+    }
+
+    pub(super) fn threshold(&self) -> u8 {
+        self.threshold
     }
 
     pub fn active_key(
@@ -235,4 +244,66 @@ fn decode_key(encoded: &str) -> Result<VerifyingKey, UpdateError> {
         .map_err(|_| UpdateError::Schema("online public key is not 32 bytes".into()))?;
     VerifyingKey::from_bytes(&bytes)
         .map_err(|error| UpdateError::Schema(format!("online public key is invalid: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn unknown_root_signer_does_not_help_meet_rotation_threshold() {
+        let trusted_a = SigningKey::from_bytes(&[41; 32]);
+        let trusted_b = SigningKey::from_bytes(&[42; 32]);
+        let unknown = SigningKey::from_bytes(&[43; 32]);
+        let online = SigningKey::from_bytes(&[44; 32]);
+        let roots = [
+            RootAnchor {
+                key_id: "trusted-root-a",
+                key: trusted_a.verifying_key(),
+            },
+            RootAnchor {
+                key_id: "trusted-root-b",
+                key: trusted_b.verifying_key(),
+            },
+        ];
+        let mut set = AnchorSet::compiled(
+            2,
+            &roots,
+            vec![OnlineKey {
+                role: KeyRole::Release,
+                key_id: "release-test".into(),
+                public_key_base64: BASE64.encode(online.verifying_key().as_bytes()),
+                not_before: "2026-01-01T00:00:00Z".parse().unwrap(),
+                not_after: "2030-01-01T00:00:00Z".parse().unwrap(),
+                status: KeyStatus::Active,
+            }],
+        );
+        set.threshold = 2;
+        let bytes = serde_json::to_vec(&set).unwrap();
+        let mut message = ANCHOR_DOMAIN.to_vec();
+        message.extend_from_slice(&bytes);
+        let signatures = serde_json::to_vec(&json!({
+            "schema": "tana.anchor-signatures.v1",
+            "signatures": [
+                {
+                    "key_id": "trusted-root-a",
+                    "algorithm": "ed25519",
+                    "signature_base64": BASE64.encode(trusted_a.sign(&message).to_bytes())
+                },
+                {
+                    "key_id": "attacker-controlled-root",
+                    "algorithm": "ed25519",
+                    "signature_base64": BASE64.encode(unknown.sign(&message).to_bytes())
+                }
+            ]
+        }))
+        .unwrap();
+
+        let error = AnchorSet::parse_and_verify(&bytes, &signatures, &roots, 2, Utc::now())
+            .expect_err("one trusted plus one unknown signature must not satisfy 2-of-2");
+        assert!(matches!(error, UpdateError::BadSignature("anchor set")));
+    }
 }

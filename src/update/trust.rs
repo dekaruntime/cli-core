@@ -163,8 +163,13 @@ impl TrustStore {
         let sig_path = self.directory.join("anchor-set.sig.json");
         match (fs::read(set_path), fs::read(sig_path)) {
             (Ok(bytes), Ok(signatures)) => {
-                let set =
-                    AnchorSet::parse_and_verify(&bytes, &signatures, &self.roots, Utc::now())?;
+                let set = AnchorSet::parse_and_verify(
+                    &bytes,
+                    &signatures,
+                    &self.roots,
+                    self.anchors.threshold(),
+                    Utc::now(),
+                )?;
                 let digest = sha256_hex(&bytes);
                 if set.generation < self.state.generation
                     || (set.generation == self.state.generation
@@ -204,7 +209,13 @@ impl TrustStore {
         bytes: &[u8],
         signatures: &[u8],
     ) -> Result<(), UpdateError> {
-        let set = AnchorSet::parse_and_verify(bytes, signatures, &self.roots, Utc::now())?;
+        let set = AnchorSet::parse_and_verify(
+            bytes,
+            signatures,
+            &self.roots,
+            self.anchors.threshold(),
+            Utc::now(),
+        )?;
         let digest = sha256_hex(bytes);
         if set.generation < self.state.generation {
             return Err(UpdateError::Freshness(format!(
