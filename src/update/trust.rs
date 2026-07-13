@@ -20,6 +20,9 @@ use super::{
 const MANIFEST_DOMAIN: &[u8] = b"tana.release-manifest.v1\n";
 pub(super) const ARTIFACT_DOMAIN: &[u8] = b"tana.release-artifact.v1\n";
 const LATEST_DOMAIN: &[u8] = b"tana.latest-statement.v1\n";
+const CEREMONY_ANCHOR_SET_FILE: &[u8] = include_bytes!("harar-generation-1-anchor-set.json");
+const CEREMONY_ANCHOR_SET_SHA256: &str =
+    "612d377629c5452b2cc01a2e6c03c63240e9ee800840fdff6d6976b8688a2a97";
 
 // PRE-MVP Ava-generated keys — MUST regenerate root offline with Sami before launch (tana#<pre-launch-issue>)
 // A registry response can rotate/revoke online keys, never these compiled roots.
@@ -31,17 +34,13 @@ const HARAR_ROOT_B: [u8; 32] = [
     0x4d, 0x12, 0x0d, 0x6f, 0xf4, 0xe5, 0x0f, 0x9d, 0xec, 0x54, 0xb7, 0xf8, 0xd7, 0x42, 0xe2, 0xf3,
     0x6f, 0x3d, 0x3f, 0x7f, 0x08, 0xac, 0xa4, 0x36, 0x35, 0xb5, 0xbb, 0x95, 0x4b, 0x19, 0xcf, 0x55,
 ];
-const HARAR_RELEASE_KEY: [u8; 32] = [
-    0x73, 0xb7, 0x0f, 0xf8, 0x08, 0x3d, 0xe6, 0xd4, 0xe7, 0x28, 0x28, 0x00, 0x78, 0x43, 0x17, 0x5d,
-    0x50, 0x62, 0x84, 0x5a, 0x25, 0xbb, 0x0f, 0xb1, 0xd7, 0x7c, 0x0b, 0x0a, 0x11, 0xa6, 0xe5, 0x85,
-];
-const HARAR_FRESHNESS_KEY: [u8; 32] = [
-    0xd6, 0x42, 0xe5, 0xb1, 0x08, 0x18, 0x3d, 0x0e, 0x63, 0xdd, 0x7c, 0xc2, 0x2b, 0x0e, 0x3c, 0x62,
-    0x18, 0x64, 0xa9, 0xe4, 0xc1, 0x6d, 0xfc, 0x55, 0x9b, 0x2e, 0xe8, 0x5a, 0x49, 0x25, 0x2d, 0x90,
-];
-const RELEASE_KEY_ID: &str = "harar-release-2026-preMVP";
-const FRESHNESS_KEY_ID: &str = "harar-freshness-2026-preMVP";
 const COMPILED_ANCHOR_GENERATION: u64 = 1;
+
+fn ceremony_anchor_set() -> &'static [u8] {
+    CEREMONY_ANCHOR_SET_FILE
+        .strip_suffix(b"\n")
+        .expect("compiled ceremony anchor fixture must have exactly one terminal newline")
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -78,15 +77,23 @@ impl TrustStore {
             root("harar-root-a", HARAR_ROOT_A)?,
             root("harar-root-b", HARAR_ROOT_B)?,
         ];
-        let anchors = AnchorSet::compiled(
-            COMPILED_ANCHOR_GENERATION,
-            &roots,
-            vec![
-                online(KeyRole::Release, RELEASE_KEY_ID, HARAR_RELEASE_KEY)?,
-                online(KeyRole::Freshness, FRESHNESS_KEY_ID, HARAR_FRESHNESS_KEY)?,
-            ],
-        );
-        Self::open_with_material(directory.into(), roots, anchors)
+        let ceremony_anchor_set = ceremony_anchor_set();
+        let anchors: AnchorSet = serde_json::from_slice(ceremony_anchor_set).map_err(|error| {
+            UpdateError::Schema(format!("compiled anchor set is invalid: {error}"))
+        })?;
+        if anchors.generation != COMPILED_ANCHOR_GENERATION
+            || sha256_hex(ceremony_anchor_set) != CEREMONY_ANCHOR_SET_SHA256
+        {
+            return Err(UpdateError::Schema(
+                "compiled anchor floor does not match the generation-1 ceremony".into(),
+            ));
+        }
+        Self::open_with_material_and_floor(
+            directory.into(),
+            roots,
+            anchors,
+            CEREMONY_ANCHOR_SET_SHA256.into(),
+        )
     }
 
     fn open_with_material(
@@ -94,8 +101,17 @@ impl TrustStore {
         roots: Vec<RootAnchor>,
         anchors: AnchorSet,
     ) -> Result<Self, UpdateError> {
-        create_private_directory(&directory)?;
         let anchor_bytes_sha256 = sha256_hex(&serde_json::to_vec(&anchors)?);
+        Self::open_with_material_and_floor(directory, roots, anchors, anchor_bytes_sha256)
+    }
+
+    fn open_with_material_and_floor(
+        directory: PathBuf,
+        roots: Vec<RootAnchor>,
+        anchors: AnchorSet,
+        anchor_bytes_sha256: String,
+    ) -> Result<Self, UpdateError> {
+        create_private_directory(&directory)?;
         let mut store = Self {
             directory,
             state: PersistedTrust::default(),
@@ -437,12 +453,6 @@ fn root(key_id: &str, bytes: [u8; 32]) -> Result<RootAnchor, UpdateError> {
     })
 }
 
-fn online(role: KeyRole, key_id: &str, bytes: [u8; 32]) -> Result<OnlineKey, UpdateError> {
-    let key = VerifyingKey::from_bytes(&bytes)
-        .map_err(|error| UpdateError::Schema(format!("compiled online key is invalid: {error}")))?;
-    Ok(online_key(role, key_id, key))
-}
-
 fn online_key(role: KeyRole, key_id: &str, key: VerifyingKey) -> OnlineKey {
     OnlineKey {
         role,
@@ -501,4 +511,82 @@ pub(super) fn atomic_private_write(
     fs::rename(&temporary, &final_path)?;
     File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ceremony_floor_tests {
+    use ed25519_dalek::SigningKey;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::update::trust_anchor::build_bootstrap_anchor_set;
+
+    #[test]
+    fn real_generation_one_ceremony_anchor_is_accepted() {
+        let ceremony_bytes = fs::read("/etc/tana/harar-anchor/anchor-set.json")
+            .expect("the generation-1 ceremony anchor must be installed");
+        let ceremony_signatures = fs::read("/etc/tana/harar-anchor/anchor-set.sig.json")
+            .expect("the generation-1 ceremony signatures must be installed");
+        assert_eq!(ceremony_bytes, ceremony_anchor_set());
+        assert_eq!(sha256_hex(&ceremony_bytes), CEREMONY_ANCHOR_SET_SHA256);
+
+        let directory = tempdir().unwrap();
+        let mut store = TrustStore::open(directory.path()).unwrap();
+        store
+            .accept_anchor_set(&ceremony_bytes, &ceremony_signatures)
+            .expect("the exact ceremony anchor must satisfy the compiled floor");
+        assert_eq!(store.generation(), COMPILED_ANCHOR_GENERATION);
+    }
+
+    #[test]
+    fn differently_keyed_root_signed_generation_one_anchor_is_rejected() {
+        let root_a = SigningKey::from_bytes(&[61; 32]);
+        let root_b = SigningKey::from_bytes(&[62; 32]);
+        let release = SigningKey::from_bytes(&[63; 32]);
+        let freshness = SigningKey::from_bytes(&[64; 32]);
+        let issued_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        let expires_at = "2030-01-01T00:00:00Z".parse().unwrap();
+        let ceremony = build_bootstrap_anchor_set(
+            &root_a, &root_b, &release, &freshness, issued_at, expires_at,
+        )
+        .unwrap();
+        let roots = vec![
+            RootAnchor {
+                key_id: "harar-root-a".into(),
+                key: root_a.verifying_key(),
+            },
+            RootAnchor {
+                key_id: "harar-root-b".into(),
+                key: root_b.verifying_key(),
+            },
+        ];
+        let anchors: AnchorSet = serde_json::from_slice(&ceremony.anchor_set).unwrap();
+        let floor = sha256_hex(&ceremony.anchor_set);
+        let directory = tempdir().unwrap();
+        let mut store = TrustStore::open_with_material_and_floor(
+            directory.path().into(),
+            roots,
+            anchors,
+            floor,
+        )
+        .unwrap();
+
+        let attacker_release = SigningKey::from_bytes(&[65; 32]);
+        let attacker_freshness = SigningKey::from_bytes(&[66; 32]);
+        let replacement = build_bootstrap_anchor_set(
+            &root_a,
+            &root_b,
+            &attacker_release,
+            &attacker_freshness,
+            issued_at,
+            expires_at,
+        )
+        .unwrap();
+        let error = store
+            .accept_anchor_set(&replacement.anchor_set, &replacement.signatures)
+            .expect_err("different root-signed generation-1 bytes must not replace the floor");
+        assert!(
+            matches!(error, UpdateError::Freshness(message) if message.contains("equal anchor generation"))
+        );
+    }
 }
