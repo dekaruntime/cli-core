@@ -245,6 +245,7 @@ impl Fixture {
                 allow_major_upgrade: false,
             },
             install_path: self.root.path().join(format!("install/{suffix}/deka")),
+            state_dir: None,
         }
     }
 

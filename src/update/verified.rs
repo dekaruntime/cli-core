@@ -22,12 +22,14 @@ use super::{install::Receipt, schema::ReleaseManifest, sha256_reader, TrustStore
 pub struct VerifiedArtifact {
     staged_binary: NamedTempFile,
     install_path: PathBuf,
+    state_dir: Option<PathBuf>,
     receipt: Receipt,
 }
 
 impl VerifiedArtifact {
     pub(super) fn verify(
         install_path: PathBuf,
+        state_dir: Option<PathBuf>,
         manifest: ReleaseManifest,
         mut artifact_bytes: Vec<u8>,
         artifact_signature: Vec<u8>,
@@ -149,12 +151,18 @@ impl VerifiedArtifact {
         Ok(Self {
             staged_binary: binary,
             install_path,
+            state_dir,
             receipt,
         })
     }
 
-    pub(super) fn into_parts(self) -> (NamedTempFile, PathBuf, Receipt) {
-        (self.staged_binary, self.install_path, self.receipt)
+    pub(super) fn into_parts(self) -> (NamedTempFile, PathBuf, Option<PathBuf>, Receipt) {
+        (
+            self.staged_binary,
+            self.install_path,
+            self.state_dir,
+            self.receipt,
+        )
     }
 }
 

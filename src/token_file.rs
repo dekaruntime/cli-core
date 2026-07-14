@@ -117,6 +117,25 @@ impl TokenStore {
         write_result
     }
 
+    /// Removes the shared credential and durably records the directory change.
+    pub fn remove_token(&self) -> Result<bool, TokenFileError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| TokenFileError::InvalidPath(self.path.clone()))?;
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                sync_dir(parent)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(TokenFileError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+
     fn temp_path(&self) -> PathBuf {
         let pid = std::process::id();
         let nanos = SystemTime::now()
@@ -248,6 +267,18 @@ mod tests {
             let mode = fs::metadata(store.path()).unwrap().mode() & 0o777;
             assert_eq!(mode, TOKEN_FILE_MODE);
         }
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(temp.path().join("token"));
+        store
+            .write_token(&SecretToken::new("tg_usr_remove").unwrap())
+            .unwrap();
+        assert!(store.remove_token().unwrap());
+        assert!(!store.remove_token().unwrap());
+        assert!(store.read_token().unwrap().is_none());
     }
 
     #[cfg(unix)]

@@ -57,6 +57,7 @@ impl Harness {
             target: TargetTriple::new("x86_64-unknown-linux-musl").unwrap(),
             selector,
             install_path: self.install_path(),
+            state_dir: None,
         }
     }
 
@@ -356,6 +357,88 @@ fn valid_release_installs_exact_fetched_bytes_once() {
     assert_eq!(fs::read(harness.install_path()).unwrap(), expected_binary);
     assert_eq!(installed.version().to_string(), "1.8.0");
     assert!(transport.fetched_once());
+}
+
+#[test]
+fn monitor_authenticates_latest_without_fetching_or_installing_artifact() {
+    let harness = Harness::new();
+    let install_transport = harness.release("1.8.0", 1, "valid");
+    let mut trust = harness.trust();
+    let installer = AtomicInstaller::new(Duration::from_secs(2)).unwrap();
+    verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &install_transport,
+        &installer,
+        &mut trust,
+    )
+    .unwrap();
+
+    let monitor_transport = harness.release("1.9.0", 2, "newer");
+    let status = inspect_signed_installation(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: true,
+        }),
+        &monitor_transport,
+        &installer,
+        &mut trust,
+    )
+    .unwrap();
+
+    assert_eq!(status.local.version.to_string(), "1.8.0");
+    assert_eq!(status.latest_version.to_string(), "1.9.0");
+    assert!(status.update_available);
+    let counts = monitor_transport.counts.borrow();
+    assert_eq!((counts.latest, counts.latest_sig), (1, 1));
+    assert_eq!(
+        (
+            counts.manifest,
+            counts.manifest_sig,
+            counts.artifact,
+            counts.artifact_sig
+        ),
+        (0, 0, 0, 0)
+    );
+}
+
+#[test]
+fn monitoring_a_new_major_does_not_approve_its_installation() {
+    let harness = Harness::new();
+    let initial = harness.release("1.8.0", 1, "valid");
+    let mut trust = harness.trust();
+    let installer = AtomicInstaller::new(Duration::from_secs(2)).unwrap();
+    verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &initial,
+        &installer,
+        &mut trust,
+    )
+    .unwrap();
+    let major = harness.release("2.0.0", 2, "major");
+    let status = inspect_signed_installation(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: true,
+        }),
+        &major,
+        &installer,
+        &mut trust,
+    )
+    .unwrap();
+    assert!(status.update_available);
+
+    let error = verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &major,
+        &installer,
+        &mut trust,
+    )
+    .unwrap_err();
+    assert!(matches!(error, UpdateError::Freshness(_)));
 }
 
 #[test]

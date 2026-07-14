@@ -99,7 +99,7 @@ fn post_swap_unhealthy_recovery_restores_only_transition_receipt_bytes() {
 
 fn setup(request: &UpdateRequest) -> InstallPaths {
     fs::create_dir_all(request.install_path.parent().unwrap()).unwrap();
-    let paths = InstallPaths::new(&request.install_path).unwrap();
+    let paths = InstallPaths::new(request).unwrap();
     ensure_private_state_dir(&paths.state_dir).unwrap();
     paths
 }
@@ -111,6 +111,7 @@ fn request(root: &TempDir, selector: VersionSelector) -> UpdateRequest {
         target: TargetTriple::new("x86_64-unknown-linux-musl").unwrap(),
         selector,
         install_path: root.path().join("bin/deka"),
+        state_dir: None,
     }
 }
 

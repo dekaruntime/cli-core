@@ -1,8 +1,8 @@
 [package]
 name = "tana-cli-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Shared Tana CLI primitives for auth token storage and linkhash identity"
+description = "Shared Tana CLI self-update, monitor, auth, and setup framework"
 
 [dependencies]
 anyhow = "1.0"

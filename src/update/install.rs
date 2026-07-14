@@ -16,7 +16,7 @@ use super::{
     schema::{LatestStatement, ReleaseManifest},
     sha256_hex, sha256_reader,
     trust::atomic_private_write,
-    CliName, InstalledRelease, UpdateError, UpdateRequest, VerifiedArtifact,
+    InstalledRelease, LocalInstallation, UpdateError, UpdateRequest, VerifiedArtifact,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,12 +149,14 @@ fn manifest_version(manifest: &ReleaseManifest) -> String {
 /// only the opaque [`VerifiedArtifact`] capability.
 pub struct AtomicInstaller {
     health_timeout: Duration,
+    health_argv: Vec<String>,
 }
 
 impl Default for AtomicInstaller {
     fn default() -> Self {
         Self {
             health_timeout: default_health_timeout(),
+            health_argv: vec!["--self-test".into()],
         }
     }
 }
@@ -166,14 +168,68 @@ impl AtomicInstaller {
                 "health timeout must be between 1ns and 300 seconds".into(),
             ));
         }
-        Ok(Self { health_timeout })
+        Ok(Self {
+            health_timeout,
+            health_argv: vec!["--self-test".into()],
+        })
+    }
+
+    pub fn with_health_probe(
+        health_timeout: Duration,
+        health_argv: Vec<String>,
+    ) -> Result<Self, UpdateError> {
+        let mut installer = Self::new(health_timeout)?;
+        if health_argv.is_empty() {
+            return Err(UpdateError::InvalidRequest(
+                "health argv must not be empty".into(),
+            ));
+        }
+        if health_argv.iter().any(|argument| argument.contains('\0')) {
+            return Err(UpdateError::InvalidRequest(
+                "health argv contains a NUL byte".into(),
+            ));
+        }
+        installer.health_argv = health_argv;
+        Ok(installer)
+    }
+
+    pub(super) fn inspect(
+        &self,
+        request: &UpdateRequest,
+    ) -> Result<LocalInstallation, UpdateError> {
+        let paths = InstallPaths::new(request)?;
+        let receipt = read_optional_receipt(&paths.current_receipt)?
+            .ok_or_else(|| UpdateError::LocalState("current install receipt is missing".into()))?;
+        if !receipt.matches_request(request) {
+            return Err(UpdateError::LocalState(
+                "current receipt identity differs from this product".into(),
+            ));
+        }
+        if !verified_file(&request.install_path, &receipt)? {
+            return Err(UpdateError::LocalState(
+                "installed binary differs from its verified receipt".into(),
+            ));
+        }
+        let health_ok = run_health_probe(
+            &request.install_path,
+            &self.health_argv,
+            self.health_timeout,
+        )
+        .is_ok();
+        Ok(LocalInstallation {
+            version: receipt.version,
+            binary_sha256: receipt.binary_sha256,
+            release_key_id: receipt.release_key_id,
+            anchor_generation: receipt.anchor_generation,
+            health_ok,
+        })
     }
 
     pub(super) fn recover(
         &self,
         request: &UpdateRequest,
     ) -> Result<Option<InstalledRelease>, UpdateError> {
-        let paths = InstallPaths::new(&request.install_path)?;
+        let paths = InstallPaths::new(request)?;
         let Some(pending) = read_optional_transition(&paths.pending_receipt)? else {
             return Ok(None);
         };
@@ -207,8 +263,8 @@ impl AtomicInstaller {
         &self,
         artifact: VerifiedArtifact,
     ) -> Result<InstalledRelease, UpdateError> {
-        let (staged, install_path, receipt) = artifact.into_parts();
-        let paths = InstallPaths::new(&install_path)?;
+        let (staged, install_path, state_dir, receipt) = artifact.into_parts();
+        let paths = InstallPaths::from_parts(&install_path, state_dir)?;
         ensure_private_state_dir(&paths.state_dir)?;
         reject_symlink(&install_path)?;
 
@@ -249,7 +305,7 @@ impl AtomicInstaller {
         request: &UpdateRequest,
     ) -> Result<InstalledRelease, UpdateError> {
         let install_path = &request.install_path;
-        let paths = InstallPaths::new(install_path)?;
+        let paths = InstallPaths::new(request)?;
         let previous = read_optional_receipt(&paths.previous_receipt)?
             .ok_or_else(|| UpdateError::Rollback("no retained previous receipt".into()))?;
         let current = read_optional_receipt(&paths.current_receipt)?
@@ -413,28 +469,36 @@ impl AtomicInstaller {
     }
 
     fn health_check(&self, install_path: &Path) -> Result<(), String> {
-        let mut child = Command::new(install_path)
-            .arg("--self-test")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("could not execute --self-test: {error}"))?;
-        let deadline = Instant::now() + self.health_timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(status)) => return Err(format!("--self-test exited with {status}")),
-                Ok(None) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("--self-test exceeded {:?}", self.health_timeout));
-                }
-                Err(error) => return Err(format!("could not wait for --self-test: {error}")),
+        run_health_probe(install_path, &self.health_argv, self.health_timeout)
+    }
+}
+
+fn run_health_probe(
+    install_path: &Path,
+    argv: &[String],
+    health_timeout: Duration,
+) -> Result<(), String> {
+    let mut child = Command::new(install_path)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("could not execute health probe: {error}"))?;
+    let deadline = Instant::now() + health_timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => return Err(format!("health probe exited with {status}")),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
             }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("health probe exceeded {health_timeout:?}"));
+            }
+            Err(error) => return Err(format!("could not wait for --self-test: {error}")),
         }
     }
 }
@@ -444,10 +508,12 @@ pub(super) struct InstallLock {
 }
 
 impl InstallLock {
-    pub(super) fn acquire(name: &CliName, install_path: &Path) -> Result<Self, UpdateError> {
-        let paths = InstallPaths::new(install_path)?;
+    pub(super) fn acquire(request: &UpdateRequest) -> Result<Self, UpdateError> {
+        let paths = InstallPaths::new(request)?;
         ensure_private_state_dir(&paths.state_dir)?;
-        let lock_path = paths.state_dir.join(format!("{}.lock", name.as_str()));
+        let lock_path = paths
+            .state_dir
+            .join(format!("{}.lock", request.name.as_str()));
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -481,7 +547,14 @@ struct InstallPaths {
 }
 
 impl InstallPaths {
-    fn new(install_path: &Path) -> Result<Self, UpdateError> {
+    fn new(request: &UpdateRequest) -> Result<Self, UpdateError> {
+        Self::from_parts(&request.install_path, request.state_dir.clone())
+    }
+
+    fn from_parts(
+        install_path: &Path,
+        configured_state_dir: Option<PathBuf>,
+    ) -> Result<Self, UpdateError> {
         let parent = install_path
             .parent()
             .ok_or_else(|| UpdateError::InvalidRequest("install path has no parent".into()))?
@@ -491,7 +564,8 @@ impl InstallPaths {
             .ok_or_else(|| UpdateError::InvalidRequest("install path has no filename".into()))?
             .to_os_string();
         let stem = file_name.to_string_lossy().into_owned();
-        let state_dir = parent.join(format!(".{stem}.tana-update"));
+        let state_dir =
+            configured_state_dir.unwrap_or_else(|| parent.join(format!(".{stem}.tana-update")));
         Ok(Self {
             parent: parent.clone(),
             current_receipt: state_dir.join("current-receipt.json"),

@@ -9,6 +9,7 @@
 compile_error!("signed self-update currently requires Unix atomic rename and inode semantics");
 
 mod http_transport;
+mod inspection;
 mod install;
 mod schema;
 mod trust;
@@ -33,6 +34,7 @@ use self::{
 };
 
 pub use http_transport::HttpReleaseTransport;
+pub use inspection::{inspect_signed_installation, LocalInstallation, SignedInstallationStatus};
 pub use install::AtomicInstaller;
 pub use trust::TrustStore;
 pub use trust_anchor::{build_bootstrap_anchor_set, BootstrapAnchorSet};
@@ -114,6 +116,9 @@ pub struct UpdateRequest {
     pub target: TargetTriple,
     pub selector: VersionSelector,
     pub install_path: PathBuf,
+    /// Owner-private receipt/journal directory. `None` preserves the original
+    /// beside-the-binary layout for existing low-level integrations.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Coordinates passed to the hostile transport. The core derives every member
@@ -261,6 +266,8 @@ pub enum UpdateError {
     Io(#[from] std::io::Error),
     #[error("installed candidate failed health check: {0}")]
     Health(String),
+    #[error("local install state is invalid: {0}")]
+    LocalState(String),
     #[error("rollback is unavailable: {0}")]
     Rollback(String),
 }
@@ -280,7 +287,7 @@ pub fn verify_and_install(
     trust: &mut TrustStore,
 ) -> Result<InstalledRelease, UpdateError> {
     validate_install_path(&request.install_path)?;
-    let _lock = InstallLock::acquire(&request.name, &request.install_path)?;
+    let _lock = InstallLock::acquire(&request)?;
     trust.reload()?;
     if let Some(recovered) = installer.recover(&request)? {
         return Ok(recovered);
@@ -387,6 +394,7 @@ pub fn verify_and_install(
     let receipt = install::Receipt::new(&request, &manifest, accepted.as_ref(), trust.generation());
     let artifact = VerifiedArtifact::verify(
         request.install_path.clone(),
+        request.state_dir.clone(),
         manifest,
         artifact_bytes,
         artifact_signature,
@@ -400,7 +408,11 @@ pub fn verify_and_install(
     installer.install(artifact)
 }
 
-fn bounded(object: &'static str, bytes: Vec<u8>, limit: usize) -> Result<Vec<u8>, UpdateError> {
+pub(super) fn bounded(
+    object: &'static str,
+    bytes: Vec<u8>,
+    limit: usize,
+) -> Result<Vec<u8>, UpdateError> {
     if bytes.len() > limit {
         return Err(UpdateError::ResponseTooLarge {
             object,
@@ -427,7 +439,7 @@ fn validate_segment(label: &str, value: &str) -> Result<(), UpdateError> {
     Ok(())
 }
 
-fn validate_install_path(path: &Path) -> Result<(), UpdateError> {
+pub(super) fn validate_install_path(path: &Path) -> Result<(), UpdateError> {
     if !path.is_absolute() || path.file_name().is_none() || path.parent().is_none() {
         return Err(UpdateError::InvalidRequest(
             "install_path must be an absolute executable path".into(),
