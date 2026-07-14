@@ -616,6 +616,46 @@ fn failed_first_install_removes_candidate_from_executable_path() {
 }
 
 #[test]
+fn signed_update_quarantines_unreceipted_legacy_install_before_replacement() {
+    let harness = Harness::new();
+    let release = harness.release("1.8.0", 1, "signed replacement");
+    let signed_binary = decode(&release.artifact);
+    fs::create_dir_all(harness.install_path().parent().unwrap()).unwrap();
+    fs::write(harness.install_path(), b"legacy unsigned updater bytes").unwrap();
+    let mut trust = harness.trust();
+
+    let installed = verify_and_install(
+        harness.request(VersionSelector::Latest {
+            allow_major_upgrade: false,
+        }),
+        &release,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap();
+
+    assert_eq!(installed.version().to_string(), "1.8.0");
+    assert_eq!(fs::read(harness.install_path()).unwrap(), signed_binary);
+    let quarantine = harness
+        .install_path()
+        .parent()
+        .unwrap()
+        .join(".deka.tana-update/legacy-unverified.bin");
+    assert_eq!(
+        fs::read(&quarantine).unwrap(),
+        b"legacy unsigned updater bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(quarantine).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+}
+
+#[test]
 fn root_signed_rotation_accepts_new_release_key_and_persists_generation() {
     const ROTATED_ID: &str = "harar-release-rotated";
     let harness = Harness::new();

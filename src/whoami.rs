@@ -20,6 +20,7 @@ impl LinkhashClient {
 
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(WhoamiError::HttpClient)?;
 
@@ -70,6 +71,33 @@ impl LinkhashClient {
     pub fn whoami_from_store(&self, store: &TokenStore) -> Result<Principal, WhoamiError> {
         let token = store.read_token()?.ok_or(WhoamiError::NotLoggedIn)?;
         self.whoami(&token)
+    }
+
+    pub fn revoke(&self, token: &SecretToken, token_id: i64) -> Result<(), WhoamiError> {
+        let url = format!("{}/api/tokens/{token_id}", self.base_url);
+        let response = self
+            .http
+            .delete(url)
+            .bearer_auth(token.expose_secret())
+            .send()
+            .map_err(WhoamiError::Request)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let message = response
+            .json::<serde_json::Value>()
+            .ok()
+            .and_then(|body| {
+                body.get("error")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "token revocation failed".to_string());
+        Err(WhoamiError::Rejected {
+            status: status.as_u16(),
+            message,
+        })
     }
 }
 

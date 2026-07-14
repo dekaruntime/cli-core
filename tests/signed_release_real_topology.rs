@@ -370,6 +370,44 @@ fn real_linkhash_process_artifact_tamper_never_reaches_install_path() {
     assert!(!install_path.exists());
 }
 
+#[test]
+#[ignore = "requires LINKHASH_REAL_BINARY built from the signed-release producer branch"]
+fn legacy_unreceipted_binary_migrates_only_to_real_signed_release() {
+    let fixture = Fixture::start();
+    let request = fixture.request("legacy-migration");
+    let install_path = request.install_path.clone();
+    fs::create_dir_all(install_path.parent().unwrap()).unwrap();
+    fs::write(&install_path, b"legacy updater bytes without a receipt").unwrap();
+    let mut trust = fixture.trust("trust-legacy-migration");
+
+    let installed = verify_and_install(
+        request,
+        &fixture.transport,
+        &AtomicInstaller::default(),
+        &mut trust,
+    )
+    .unwrap();
+
+    assert_eq!(installed.version().to_string(), "1.8.0");
+    assert_eq!(fs::read(&install_path).unwrap(), fixture.expected_binary);
+    let quarantine = fixture
+        .root
+        .path()
+        .join("install/legacy-migration/.deka.tana-update/legacy-unverified.bin");
+    assert_eq!(
+        fs::read(&quarantine).unwrap(),
+        b"legacy updater bytes without a receipt"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(quarantine).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+}
+
 fn initialize_linkhash(store: &Path, data: &Path, config: &Path) {
     let status = Command::new(linkhash_binary())
         .args(["server", "init"])

@@ -155,7 +155,7 @@ impl SharedCli {
                 let report =
                     self.monitor_report(&transport, &installer, &mut trust, target, install_path)?;
                 if should_emit {
-                    emit_to_ruba(&report, self.timeout)?;
+                    self.emit_monitor_report(&report)?;
                 }
                 Ok(SelfOutcome::Monitored { report, json })
             }
@@ -186,6 +186,10 @@ impl SharedCli {
                 Ok(SelfOutcome::RolledBack(installed))
             }
         }
+    }
+
+    pub fn emit_monitor_report(&self, report: &MonitorReport) -> Result<(), CliCoreError> {
+        emit_to_ruba(report, self.timeout)
     }
 
     fn request(
@@ -248,24 +252,35 @@ impl SharedCli {
 }
 
 fn emit_to_ruba(report: &MonitorReport, timeout: Duration) -> Result<(), CliCoreError> {
-    let origin = std::env::var("TANA_RUBA_URL")
-        .map_err(|_| CliCoreError::Ruba("TANA_RUBA_URL is not set".into()))?;
-    let token = std::env::var("TANA_RUBA_TOKEN")
-        .map_err(|_| CliCoreError::Ruba("TANA_RUBA_TOKEN is not set".into()))?;
+    let origin =
+        std::env::var("RUBA_URL").map_err(|_| CliCoreError::Ruba("RUBA_URL is not set".into()))?;
+    let token = std::env::var("RUBA_SOURCE_TOKEN")
+        .map_err(|_| CliCoreError::Ruba("RUBA_SOURCE_TOKEN is not set".into()))?;
+    let endpoint = ruba_endpoint(&origin)?;
     let body = serde_json::json!({
         "source_id": format!("cli.{}", report.name),
-        "events": [{"kind": "cli.self.monitor", "payload": report}],
+        "events": [{
+            "kind": "cli.self.monitor",
+            "ts": report.checked_at.timestamp_millis(),
+            "payload": {
+                "actor": format!("cli.{}", report.name),
+                "name": report.name,
+                "installed_version": report.installed_version,
+                "installed_digest": report.installed_digest,
+                "latest_version": report.latest_version,
+                "update_available": report.update_available,
+                "health": report.health,
+                "key_id": report.key_id,
+                "anchor_generation": report.anchor_generation,
+                "checked_at": report.checked_at,
+            },
+        }],
     });
     let response = reqwest::blocking::Client::builder()
         .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .and_then(|client| {
-            client
-                .post(format!("{}/v1/push", origin.trim_end_matches('/')))
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-        })
+        .and_then(|client| client.post(endpoint).bearer_auth(token).json(&body).send())
         .map_err(|error| CliCoreError::Ruba(error.to_string()))?;
     if !response.status().is_success() {
         return Err(CliCoreError::Ruba(format!(
@@ -274,4 +289,31 @@ fn emit_to_ruba(report: &MonitorReport, timeout: Duration) -> Result<(), CliCore
         )));
     }
     Ok(())
+}
+
+fn ruba_endpoint(origin: &str) -> Result<reqwest::Url, CliCoreError> {
+    let mut url = reqwest::Url::parse(origin)
+        .map_err(|error| CliCoreError::Ruba(format!("RUBA_URL is invalid: {error}")))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(CliCoreError::Ruba(
+            "RUBA_URL must not contain credentials, a query, or a fragment".into(),
+        ));
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return Err(CliCoreError::Ruba(
+            "RUBA_URL must use HTTPS (HTTP is allowed only for loopback)".into(),
+        ));
+    }
+    url.set_path(&format!("{}/v1/push", url.path().trim_end_matches('/')));
+    Ok(url)
 }

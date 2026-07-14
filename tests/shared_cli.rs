@@ -9,7 +9,7 @@ use std::{
 use tana_cli_core::{
     AuthSpec, CliPaths, HealthProbe, HealthStatus, LoginOptions, MonitorReport, ProductSpec,
     SecretToken, SelfOutcome, SetupAction, SetupContext, SetupError, SetupOptions, SetupPlan,
-    SetupStep, SharedCli,
+    SetupStep, SharedCli, TokenStore,
 };
 
 struct FixturePlan {
@@ -100,19 +100,27 @@ fn login_validates_before_atomic_storage_and_logout_is_idempotent() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = Box::leak(format!("http://{}", listener.local_addr().unwrap()).into_boxed_str());
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut bytes = [0_u8; 4096];
-        let count = stream.read(&mut bytes).unwrap();
-        let request = String::from_utf8_lossy(&bytes[..count]);
-        assert!(request.contains("authorization: Bearer tg_usr_shared"));
-        let body = r#"{"ok":true,"principal":{"identity":{"id":"samira","kind":"agent","handle":"samira"}}}"#;
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
+        for request_number in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let count = stream.read(&mut bytes).unwrap();
+            let request = String::from_utf8_lossy(&bytes[..count]);
+            assert!(request.contains("authorization: Bearer tg_usr_shared"));
+            let body = if request_number < 2 {
+                assert!(request.starts_with("GET /api/v1/whoami HTTP/1.1"));
+                r#"{"ok":true,"principal":{"identity":{"id":"samira","kind":"agent","handle":"samira"},"token_id":41}}"#
+            } else {
+                assert!(request.starts_with("DELETE /api/tokens/41 HTTP/1.1"));
+                r#"{"status":"revoked"}"#
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
     });
     let temp = tempfile::tempdir().unwrap();
     let shared = SharedCli::with_paths(product(origin), paths(temp.path()));
@@ -128,6 +136,50 @@ fn login_validates_before_atomic_storage_and_logout_is_idempotent() {
     shared.logout().unwrap();
     shared.logout().unwrap();
     assert!(!token_path.exists());
+}
+
+#[test]
+fn logout_keeps_local_token_when_server_revocation_fails() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = Box::leak(format!("http://{}", listener.local_addr().unwrap()).into_boxed_str());
+    thread::spawn(move || {
+        for request_number in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0_u8; 4096];
+            let count = stream.read(&mut bytes).unwrap();
+            let request = String::from_utf8_lossy(&bytes[..count]);
+            let (status, body) = if request_number == 0 {
+                assert!(request.starts_with("GET /api/v1/whoami HTTP/1.1"));
+                (
+                    "200 OK",
+                    r#"{"ok":true,"principal":{"identity":{"id":"samira"},"token_id":42}}"#,
+                )
+            } else {
+                assert!(request.starts_with("DELETE /api/tokens/42 HTTP/1.1"));
+                (
+                    "503 Service Unavailable",
+                    r#"{"error":"revocation unavailable"}"#,
+                )
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(), body
+            )
+            .unwrap();
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let shared = SharedCli::with_paths(product(origin), paths(temp.path()));
+    let token_path = temp.path().join("config/tana/token");
+    TokenStore::new(&token_path)
+        .write_token(&SecretToken::new("tg_usr_shared").unwrap())
+        .unwrap();
+
+    let error = shared.logout().unwrap_err().to_string();
+
+    assert!(error.contains("revocation unavailable"));
+    assert!(token_path.exists());
 }
 
 #[test]

@@ -365,12 +365,10 @@ impl AtomicInstaller {
         if !install_path.exists() {
             return Ok(None);
         }
-        let current = read_optional_receipt(&paths.current_receipt)?.ok_or_else(|| {
-            UpdateError::Digest(format!(
-                "refusing to replace {} without a verified current receipt",
-                display_path(install_path)
-            ))
-        })?;
+        let Some(current) = read_optional_receipt(&paths.current_receipt)? else {
+            quarantine_legacy_install(paths, install_path)?;
+            return Ok(None);
+        };
         if !verified_file(install_path, &current)? {
             return Err(UpdateError::Digest(
                 "current installation differs from its verified receipt".into(),
@@ -544,6 +542,7 @@ struct InstallPaths {
     pending_receipt: PathBuf,
     receipt_log: PathBuf,
     failed_log: PathBuf,
+    legacy_quarantine: PathBuf,
 }
 
 impl InstallPaths {
@@ -576,6 +575,7 @@ impl InstallPaths {
             pending_receipt: state_dir.join("pending-receipt.json"),
             receipt_log: state_dir.join("receipts.jsonl"),
             failed_log: state_dir.join("failed-receipts.jsonl"),
+            legacy_quarantine: state_dir.join("legacy-unverified.bin"),
             state_dir,
         })
     }
@@ -653,6 +653,25 @@ fn quarantine_candidate(paths: &InstallPaths, install_path: &Path) -> Result<(),
         fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o600))?;
     }
     File::open(&quarantine)?.sync_all()?;
+    Ok(())
+}
+
+fn quarantine_legacy_install(paths: &InstallPaths, install_path: &Path) -> Result<(), UpdateError> {
+    if paths.legacy_quarantine.exists() {
+        return Err(UpdateError::LocalState(format!(
+            "legacy quarantine already exists at {}",
+            display_path(&paths.legacy_quarantine)
+        )));
+    }
+    fs::rename(install_path, &paths.legacy_quarantine)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&paths.legacy_quarantine, fs::Permissions::from_mode(0o600))?;
+    }
+    File::open(&paths.legacy_quarantine)?.sync_all()?;
+    sync_directory(&paths.parent)?;
+    sync_directory(&paths.state_dir)?;
     Ok(())
 }
 
