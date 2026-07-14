@@ -5,7 +5,7 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::{Identity, LinkhashClient, SecretToken, TokenStore};
+use crate::{validate_linkhash_origin, Identity, LinkhashClient, SecretToken, TokenStore};
 
 use super::{CliCoreError, SharedCli};
 
@@ -127,15 +127,20 @@ impl SharedCli {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| CliCoreError::Auth(error.to_string()))?;
-        let authorization: DeviceAuthorization = client
-            .post(endpoint(
-                &auth.identity_origin,
-                auth.device_authorization_path,
-            ))
+        let origin = validate_linkhash_origin(&auth.identity_origin)?;
+        let authorization_response = client
+            .post(endpoint(&origin, auth.device_authorization_path)?)
             .json(&serde_json::json!({"client_name": self.product.name.as_str()}))
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .and_then(reqwest::blocking::Response::json)
+            .map_err(|error| CliCoreError::Auth(error.to_string()))?;
+        if !authorization_response.status().is_success() {
+            return Err(CliCoreError::Auth(format!(
+                "device authorization returned HTTP {}",
+                authorization_response.status()
+            )));
+        }
+        let authorization: DeviceAuthorization = authorization_response
+            .json()
             .map_err(|error| CliCoreError::Auth(error.to_string()))?;
         eprintln!(
             "Open {} and enter code {}",
@@ -145,15 +150,25 @@ impl SharedCli {
         let interval = Duration::from_secs(authorization.interval.clamp(1, 30));
         while Instant::now() < deadline {
             let response = client
-                .post(endpoint(&auth.identity_origin, auth.device_token_path))
+                .post(endpoint(&origin, auth.device_token_path)?)
                 .json(&serde_json::json!({"device_code": authorization.device_code}))
                 .send()
                 .map_err(|error| CliCoreError::Auth(error.to_string()))?;
+            if response.status().is_redirection() {
+                return Err(CliCoreError::Auth(format!(
+                    "device token exchange rejected redirect HTTP {}",
+                    response.status()
+                )));
+            }
             let pending = matches!(response.status().as_u16(), 400 | 404 | 428);
+            let success = response.status().is_success();
             let body: DeviceTokenResponse = response
                 .json()
                 .map_err(|error| CliCoreError::Auth(error.to_string()))?;
-            if let Some(token) = body.token {
+            if success {
+                let token = body.token.ok_or_else(|| {
+                    CliCoreError::Auth("device token response omitted token".into())
+                })?;
                 return SecretToken::new(token).map_err(CliCoreError::from);
             }
             if !pending && body.error.as_deref() != Some("authorization_pending") {
@@ -168,6 +183,8 @@ impl SharedCli {
     }
 }
 
-fn endpoint(origin: &str, path: &str) -> String {
-    format!("{}{}", origin.trim_end_matches('/'), path)
+fn endpoint(origin: &reqwest::Url, path: &str) -> Result<reqwest::Url, CliCoreError> {
+    origin
+        .join(path.trim_start_matches('/'))
+        .map_err(|error| CliCoreError::Auth(format!("invalid auth endpoint: {error}")))
 }

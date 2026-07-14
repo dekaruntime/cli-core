@@ -4,6 +4,7 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     thread,
+    time::Duration,
 };
 
 use tana_cli_core::{
@@ -213,4 +214,45 @@ fn monitor_outcomes_use_the_stable_health_exit_code() {
         json: true,
     };
     assert_eq!(outcome.exit_code(), 20);
+}
+
+#[test]
+fn shared_auth_rejects_insecure_origin_before_storing_bearer() {
+    let temp = tempfile::tempdir().unwrap();
+    let shared =
+        SharedCli::with_paths(product("http://linkhash.internal:9418"), paths(temp.path()));
+    let error = shared
+        .login(LoginOptions::token(
+            SecretToken::new("tg_usr_must_not_be_sent").unwrap(),
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("HTTPS"), "{error}");
+    assert!(!temp.path().join("config/tana/token").exists());
+}
+
+#[test]
+fn device_login_rejects_redirect_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = Box::leak(format!("http://{}", listener.local_addr().unwrap()).into_boxed_str());
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        let body = r#"{"device_code":"tg_device_redirect","user_code":"AAAAA-BBBBB","verification_uri":"https://example.com/verify","interval":1}"#;
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: https://example.com/stolen\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let shared = SharedCli::with_paths(product(origin), paths(temp.path()));
+    let mut options = LoginOptions::device();
+    options.timeout = Duration::from_secs(1);
+    let error = shared.login(options).unwrap_err().to_string();
+    assert!(error.contains("307"), "{error}");
+    assert!(!temp.path().join("config/tana/token").exists());
 }

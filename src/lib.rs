@@ -21,4 +21,4 @@ pub use update::{
     ReleaseChannel, ReleaseCoordinates, ReleaseTransport, SignedInstallationStatus, TargetTriple,
     TransportError, TrustStore, UpdateError, UpdateRequest, VerifiedArtifact, VersionSelector,
 };
-pub use whoami::{Identity, LinkhashClient, Principal, WhoamiError};
+pub use whoami::{validate_linkhash_origin, Identity, LinkhashClient, Principal, WhoamiError};
