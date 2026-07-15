@@ -17,8 +17,12 @@ local Linkhash facade), then declare the versioned dependency:
 
 ```toml
 [dependencies]
-tana-cli-core = { version = "0.1.0", registry = "linkhash" }
+tana-cli-core = { version = "=0.2.0", registry = "linkhash" }
 ```
+
+Version `0.1.0` is the earlier token-file and identity-only crate. The complete
+shared lifecycle facade starts at `0.2.0`; consumers pin it exactly while the
+initial integration is rolled out.
 
 Cargo authentication belongs in the caller's private Cargo credentials, never
 in this repository.
