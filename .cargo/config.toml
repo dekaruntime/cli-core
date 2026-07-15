@@ -1,0 +1,5 @@
+[registries.linkhash]
+index = "sparse+http://localhost:9418/index/"
+
+[net]
+git-fetch-with-cli = true

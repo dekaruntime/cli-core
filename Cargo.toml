@@ -1,8 +1,11 @@
 [package]
 name = "tana-cli-core"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2021"
 description = "Shared Tana CLI self-update, monitor, auth, and setup framework"
+repository = "https://git.tana.gg/tana/cli-core"
+readme = "README.md"
+publish = ["linkhash"]
 
 [dependencies]
 anyhow = "1.0"
