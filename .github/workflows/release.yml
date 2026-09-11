@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish deka-cli-core
+    runs-on: [self-hosted, macOS, ARM64]
+    environment: release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches crate version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "deka-cli-core") | .version')"
+          if [ "$CRATE_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match deka-cli-core version ${CRATE_VERSION}."
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        env:
+          CARGO_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: cargo publish --locked --registry crates-io --token "$CARGO_TOKEN"
+
+      - name: Verify published crate
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CRATE="$(mktemp)"
+
+          for attempt in $(seq 1 10); do
+            if curl --fail --location --retry 3 --retry-all-errors \
+              "https://crates.io/api/v1/crates/deka-cli-core/${VERSION}/download" \
+              --output "$CRATE"; then
+              PUBLISHED_VERSION="$(tar -xOf "$CRATE" "deka-cli-core-${VERSION}/Cargo.toml" | awk -F' = ' '/^version = / { gsub(/\"/, "", $2); print $2; exit }')"
+              if [ "$PUBLISHED_VERSION" = "$VERSION" ]; then
+                echo "Verified deka-cli-core ${PUBLISHED_VERSION} from crates.io."
+                exit 0
+              fi
+              echo "Downloaded crate version ${PUBLISHED_VERSION:-unknown}, expected ${VERSION}."
+            fi
+
+            if [ "$attempt" = 10 ]; then
+              echo "::error::deka-cli-core ${VERSION} was not available from crates.io after 10 attempts."
+              exit 1
+            fi
+            sleep 6
+          done
