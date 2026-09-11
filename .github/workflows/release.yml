@@ -43,7 +43,7 @@ jobs:
           CRATE="$(mktemp)"
 
           for attempt in $(seq 1 10); do
-            if curl --fail --location --retry 3 --retry-all-errors \
+            if curl --fail --location --retry 3 --retry-all-errors --user-agent "deka-release-verify (github.com/dekaruntime/cli-core)" \
               "https://crates.io/api/v1/crates/deka-cli-core/${VERSION}/download" \
               --output "$CRATE"; then
               PUBLISHED_VERSION="$(tar -xOf "$CRATE" "deka-cli-core-${VERSION}/Cargo.toml" | awk -F' = ' '/^version = / { gsub(/\"/, "", $2); print $2; exit }')"
