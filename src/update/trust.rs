@@ -24,7 +24,8 @@ const CEREMONY_ANCHOR_SET_FILE: &[u8] = include_bytes!("harar-generation-1-ancho
 const CEREMONY_ANCHOR_SET_SHA256: &str =
     "612d377629c5452b2cc01a2e6c03c63240e9ee800840fdff6d6976b8688a2a97";
 
-// PRE-MVP Ava-generated keys — MUST regenerate root offline with Sami before launch (tana#<pre-launch-issue>)
+// Self-update is not yet built; these compiled roots are placeholders for the
+// unfinished feature and are not used by any released binary.
 // A registry response can rotate/revoke online keys, never these compiled roots.
 const HARAR_ROOT_A: [u8; 32] = [
     0xa2, 0x92, 0x1c, 0xbc, 0xe9, 0xcc, 0x83, 0x03, 0xd3, 0xb3, 0xdb, 0xee, 0xc2, 0xb4, 0x5a, 0xbd,
