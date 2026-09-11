@@ -1,11 +1,12 @@
 [package]
 name = "deka-cli-core"
 version = "0.3.0"
+license = "Apache-2.0"
 edition = "2021"
-description = "Shared Tana CLI self-update, monitor, auth, and setup framework"
+description = "Shared core for Deka command-line tools: self-update trust machinery, CLI setup, auth and monitoring plumbing"
 repository = "https://github.com/dekaruntime/cli-core"
 readme = "README.md"
-publish = ["linkhash", "crates-io"]
+publish = ["crates-io"]
 
 [dependencies]
 anyhow = "1.0"
