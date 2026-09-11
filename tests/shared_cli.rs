@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use tana_cli_core::{
+use deka_cli_core::{
     AuthSpec, CliPaths, HealthProbe, HealthStatus, LoginOptions, MonitorReport, ProductSpec,
     SecretToken, SelfOutcome, SetupAction, SetupContext, SetupError, SetupOptions, SetupPlan,
     SetupStep, SharedCli, TokenStore,

@@ -16,7 +16,7 @@ use super::{install::Receipt, schema::ReleaseManifest, sha256_reader, TrustStore
 /// Unverified bytes cannot be promoted into this capability:
 ///
 /// ```compile_fail
-/// use tana_cli_core::VerifiedArtifact;
+/// use deka_cli_core::VerifiedArtifact;
 /// let _candidate = VerifiedArtifact {};
 /// ```
 pub struct VerifiedArtifact {

@@ -9,7 +9,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, Timelike as _, Utc};
 use ed25519_dalek::SigningKey;
-use tana_cli_core::build_bootstrap_anchor_set;
+use deka_cli_core::build_bootstrap_anchor_set;
 
 fn main() {
     if let Err(error) = run() {

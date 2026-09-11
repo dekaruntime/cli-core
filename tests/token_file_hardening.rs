@@ -2,7 +2,7 @@ use std::fs;
 use std::sync::Arc;
 use std::thread;
 
-use tana_cli_core::{token_file::TokenFileError, SecretToken, TokenStore};
+use deka_cli_core::{token_file::TokenFileError, SecretToken, TokenStore};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
