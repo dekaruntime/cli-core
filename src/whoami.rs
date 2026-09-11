@@ -2,7 +2,7 @@ use crate::token_file::{SecretToken, TokenFileError, TokenStore};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const DEFAULT_LINKHASH_URL: &str = "https://git.tana.gg";
+const DEFAULT_LINKHASH_URL: &str = "https://github.com";
 const WHOAMI_PATH: &str = "/api/v1/whoami";
 
 #[derive(Debug, Clone)]

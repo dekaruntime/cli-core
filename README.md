@@ -1,56 +1,85 @@
 # deka-cli-core
 
-`deka-cli-core` is the shared lifecycle library for Tana's Rust command-line
-tools. It provides `SharedCli` for signed self-update, check, monitor and
-rollback; Linkhash login, logout and identity lookup; XDG paths; Ruba event
-emission; and resumable declarative setup.
+Shared lifecycle library for Deka's Rust command-line tools. One crate,
+`deka-cli-core`, published from this repo.
 
-The signed update path preserves the sealed `VerifiedArtifact` boundary from
-tana#722: untrusted release bytes cannot reach the atomic installer until the
-artifact, release manifest, latest statement, trust generation, digest and
-size have all been verified.
+## What's in this crate
 
-## Use from Linkhash Cargo
+- **`cli`** — the `SharedCli` integration surface a CLI wires up once:
+  - `self_service` — signed self-update (`SelfAction::Update`), health
+    monitoring (`SelfAction::Monitor`), and rollback to the previous
+    installed release.
+  - `auth` — device-code login/logout against an identity origin, backed
+    by the token store below.
+  - `setup` — a declarative, resumable setup plan (`SetupStep` /
+    `SetupPlan`) for first-run provisioning: creating directories, writing
+    config files, running commands.
+- **`update`** — the signed-release verification and atomic-install
+  pipeline invoked by `self_service`. Downloaded release bytes only reach
+  the installer as a `VerifiedArtifact`: a capability type with no public
+  constructor, produced only after the release manifest, the "latest"
+  freshness statement, the artifact digest and size, and the trust
+  generation have all checked out against a compiled root-of-trust
+  (`TrustStore`). The compiled roots and their generation-1 anchor set are
+  embedded at build time and are public keys only; nothing here can sign
+  a release.
+- **`token_file`** — an XDG-path, mode-0600 on-disk store for a single
+  `SecretToken`, with basic hardening against symlink and permission
+  tampering.
+- **`whoami`** — a minimal HTTP client for an identity-origin `whoami`
+  endpoint, plus origin validation (`validate_linkhash_origin`) shared by
+  the auth flow.
+- **`pulse_client`** — a small async HTTP client used to emit self-update
+  and health events to an operational event sink, with bearer-token
+  support from a token file.
+- **`src/bin/harar-anchor-init.rs`** — an offline ceremony tool. Given
+  four raw 32-byte Ed25519 private-key files (mode 0600, read once,
+  zeroized after use) it produces a signed `anchor-set.json` /
+  `anchor-set.sig.json` pair. It never touches the network and is not
+  invoked by any CLI at runtime — it is how a new trust generation is
+  minted, out of band.
 
-Configure the Linkhash sparse registry (the checked-in configuration targets a
-local Linkhash facade), then declare the versioned dependency:
+## Use from Cargo
 
 ```toml
 [dependencies]
-deka-cli-core = { version = "=0.2.0", registry = "linkhash" }
+deka-cli-core = "0.2"
 ```
 
-Version `0.1.0` is the earlier token-file and identity-only crate. The complete
-shared lifecycle facade starts at `0.2.0`; consumers pin it exactly while the
-initial integration is rolled out.
+`0.1.0` was an earlier token-file/identity-only crate; `0.2.0` is the
+current shared lifecycle facade and is where new consumers should start.
 
-Cargo authentication belongs in the caller's private Cargo credentials, never
-in this repository.
+A CLI wires this in roughly as:
 
-## Validate
+```rust
+use deka_cli_core::{AuthSpec, HealthProbe, ProductSpec, SelfAction, SharedCli};
+
+let product = ProductSpec::new("mycli", env!("CARGO_PKG_VERSION"), "https://example.invalid", HealthProbe::argv(&["--self-test"]))?
+    .with_auth(AuthSpec::new("https://identity.example.invalid"));
+let shared = SharedCli::from_xdg(product)?;
+shared.run_self(SelfAction::Update { check_only: false, exact: None, allow_major: false })?.print()?;
+```
+
+See `examples/` for two complete wire-ups.
+
+Credentials for any private registry you consume this crate from belong
+in the caller's own Cargo configuration, never in this repository.
+
+## Build and test
 
 ```sh
 cargo build --all-targets
 cargo test --all-targets
-cargo package --registry linkhash
 ```
 
-The separate-process signed-release topology test additionally needs a real
-Linkhash binary via `LINKHASH_REAL_BINARY`; see the test source for the exact
-invocation.
+One test file, `tests/signed_release_real_topology.rs`, exercises the
+signed-update path against a real producer binary out-of-process; those
+tests are `#[ignore]`d by default and need `LINKHASH_REAL_BINARY` set to
+that binary's path.
 
-## Extraction provenance
+## History
 
-This repository was history-preservingly extracted from
-`tana/tana@ea6aa47363f912689afd76f1a5acacb9665bde9a`, path
-`crates/tana-cli-core/`, using `git subtree split`. The extracted ancestry ends
-at `9cc36595fd49d9e8bb3a8681e8e58c9298a2f56a`; unrelated `tana/tana` history
-was intentionally excluded.
-
-`dekaruntime/cli-core` was itself seeded, full history intact, from
-`tanacommerce/tana-cli-core` (commit `b1d834a871634e41db93f445f1950c51a1ef5209`)
-per `dekaruntime/deka#837`, as the shared-crate home for crates common across
-Tana CLIs. This seed PR is a rename only (`tana-cli-core` → `deka-cli-core`);
-the workspace restructure, the `token_file.rs`/`pulse_client.rs`/linkhash
-publish-target decisions, adding `test`, and the `stdio` call are tracked as
-follow-up work on #837.
+This repository's history was extracted, full ancestry intact, from an
+earlier internal monorepo location and then renamed to its current crate
+name (`deka-cli-core`). Nothing about that predecessor affects the public
+API described above.

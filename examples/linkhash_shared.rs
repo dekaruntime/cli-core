@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "https://linkha.sh",
         HealthProbe::argv(&["--self-test"]),
     )?
-    .with_auth(AuthSpec::new("https://git.tana.gg"));
+    .with_auth(AuthSpec::new("https://github.com"));
     let shared = SharedCli::from_xdg(product)?;
     match std::env::args().nth(1).as_deref() {
         Some("update") => shared
