@@ -1,6 +1,6 @@
 [package]
 name = "deka-cli-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Shared Tana CLI self-update, monitor, auth, and setup framework"
 repository = "https://github.com/dekaruntime/cli-core"
