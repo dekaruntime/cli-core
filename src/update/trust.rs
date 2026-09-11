@@ -523,6 +523,7 @@ mod ceremony_floor_tests {
     use crate::update::trust_anchor::build_bootstrap_anchor_set;
 
     #[test]
+    #[ignore = "self-update is not yet built; needs the offline ceremony fixture at /etc/tana/harar-anchor, absent on CI runners"]
     fn real_generation_one_ceremony_anchor_is_accepted() {
         let ceremony_bytes = fs::read("/etc/tana/harar-anchor/anchor-set.json")
             .expect("the generation-1 ceremony anchor must be installed");
