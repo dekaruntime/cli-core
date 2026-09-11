@@ -15,7 +15,7 @@ use chrono::{Duration as ChronoDuration, SecondsFormat, Timelike as _, Utc};
 use ed25519_dalek::{Signer as _, SigningKey};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
-use tana_cli_core::{
+use deka_cli_core::{
     verify_and_install, AtomicInstaller, CliName, HttpReleaseTransport, ReleaseChannel,
     ReleaseCoordinates, ReleaseTransport, TargetTriple, TransportError, TrustStore, UpdateError,
     UpdateRequest, VersionSelector,

@@ -1,6 +1,6 @@
-# tana-cli-core
+# deka-cli-core
 
-`tana-cli-core` is the shared lifecycle library for Tana's Rust command-line
+`deka-cli-core` is the shared lifecycle library for Tana's Rust command-line
 tools. It provides `SharedCli` for signed self-update, check, monitor and
 rollback; Linkhash login, logout and identity lookup; XDG paths; Ruba event
 emission; and resumable declarative setup.
@@ -17,7 +17,7 @@ local Linkhash facade), then declare the versioned dependency:
 
 ```toml
 [dependencies]
-tana-cli-core = { version = "=0.2.0", registry = "linkhash" }
+deka-cli-core = { version = "=0.2.0", registry = "linkhash" }
 ```
 
 Version `0.1.0` is the earlier token-file and identity-only crate. The complete
@@ -46,3 +46,11 @@ This repository was history-preservingly extracted from
 `crates/tana-cli-core/`, using `git subtree split`. The extracted ancestry ends
 at `9cc36595fd49d9e8bb3a8681e8e58c9298a2f56a`; unrelated `tana/tana` history
 was intentionally excluded.
+
+`dekaruntime/cli-core` was itself seeded, full history intact, from
+`tanacommerce/tana-cli-core` (commit `b1d834a871634e41db93f445f1950c51a1ef5209`)
+per `dekaruntime/deka#837`, as the shared-crate home for crates common across
+Tana CLIs. This seed PR is a rename only (`tana-cli-core` → `deka-cli-core`);
+the workspace restructure, the `token_file.rs`/`pulse_client.rs`/linkhash
+publish-target decisions, adding `test`, and the `stdio` call are tracked as
+follow-up work on #837.

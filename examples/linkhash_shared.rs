@@ -1,4 +1,4 @@
-use tana_cli_core::{
+use deka_cli_core::{
     AuthSpec, HealthProbe, LoginOptions, ProductSpec, SecretToken, SelfAction, SharedCli,
 };
 

@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use tana_cli_core::{CliPaths, HealthProbe, HealthStatus, MonitorReport, ProductSpec, SharedCli};
+use deka_cli_core::{CliPaths, HealthProbe, HealthStatus, MonitorReport, ProductSpec, SharedCli};
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
