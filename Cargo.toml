@@ -8,19 +8,33 @@ repository = "https://github.com/dekaruntime/cli-core"
 readme = "README.md"
 publish = ["crates-io"]
 
+[features]
+default = ["registry", "native"]
+registry = []
+native = [
+    "dep:anyhow", "dep:base64", "dep:chrono", "dep:ed25519-dalek", "dep:fs2",
+    "dep:reqwest", "dep:semver", "dep:serde", "dep:serde_json", "dep:sha2",
+    "dep:tempfile", "dep:thiserror", "dep:tokio", "dep:zstd", "dep:zstd-safe",
+]
+
 [dependencies]
-anyhow = "1.0"
-base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-ed25519-dalek = "2"
-fs2 = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-semver = { version = "1", features = ["serde"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sha2 = "0.10"
-tempfile = "3"
-thiserror = "1.0"
-tokio = { version = "1", features = ["fs"] }
-zstd = "0.13"
-zstd-safe = "7"
+anyhow = { version = "1.0", optional = true }
+base64 = { version = "0.22", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"], optional = true }
+ed25519-dalek = { version = "2", optional = true }
+fs2 = { version = "0.4", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"], optional = true }
+semver = { version = "1", features = ["serde"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
+thiserror = { version = "1.0", optional = true }
+tokio = { version = "1", features = ["fs"], optional = true }
+zstd = { version = "0.13", optional = true }
+zstd-safe = { version = "7", optional = true }
+
+[[bin]]
+name = "harar-anchor-init"
+path = "src/bin/harar-anchor-init.rs"
+required-features = ["native"]
