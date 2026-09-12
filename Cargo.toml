@@ -38,3 +38,8 @@ zstd-safe = { version = "7", optional = true }
 name = "harar-anchor-init"
 path = "src/bin/harar-anchor-init.rs"
 required-features = ["native"]
+
+[[test]]
+name = "context_env"
+harness = false
+required-features = ["registry"]

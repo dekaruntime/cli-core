@@ -79,6 +79,38 @@ owners. `.register(specs)` still requires nonblank owners, `.inherit(specs)`
 still tags every inherited command as `"legacy"`, and `.build()` rejects
 duplicate command names across all registration paths.
 
+## Context compatibility (RFD 61)
+
+`registry::Context` exposes `args` and `env: EnvContext`, where `env.cwd` is a
+`PathBuf`. `Context::new(args)` keeps its signature and captures cwd.
+`Context::from_env(&Registry) -> Result<Self, ContextError>` parses process
+arguments and returns `ContextError::Parse(Vec<ParseError>)` on parse errors.
+`EnvContext::load() -> Self` captures cwd with a `"."` fallback. No environment
+variables or handler configuration are read. Both new types are also re-exported
+at the crate root.
+
+On wasm32, `from_env` is cfg-gated out. `EnvContext::load()` and
+`Context::new(args)` remain available and use `"."` without host process access.
+
+The dsc reference (`e3d9226`, `crates/core/src/context.rs`) has exactly this
+native Context surface. Its `Context::from_env`, exhaustive `ContextError::Parse`
+matches, and `context.env.cwd` accesses map directly to these shared types.
+
+The Deka reference (`89f173a`, `.deka-ref/crates/core/src/context.rs`) additionally
+owns `env.vars`, `handler`, and `ContextError::HandlerResolve`. Those remain
+consumer-side as required by RFD 61. Its parsed `args` and `env.cwd` map to a
+shared Context; this is not a claim that replacing Deka's entire Context with a
+re-export compiles unchanged. In particular, `crates/cli/src/lib.rs` constructs
+the richer Context, `cli/mod.rs` matches `HandlerResolve`, and self-update and
+monitor tests construct handler-bearing contexts. `tests/context_bridge.rs`
+checks the args/cwd projection and dispatch; the existing registry bridge tests
+continue to check mutable registration and `Context::new(args)` unchanged.
+
+Rust source compatibility caveat: adding the public `env` field requires old
+`Context { args }` struct literals to supply `env` or use `Context::new(args)`.
+The constructor, args field, parser, registry, and dispatch signatures are
+unchanged; this field addition cannot preserve args-only struct literals.
+
 ## Build and test
 
 ```sh

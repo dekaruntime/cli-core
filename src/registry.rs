@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct CommandSpec {
@@ -36,15 +37,52 @@ pub struct ParamSpec {
     pub description: &'static str,
 }
 
-/// Parsed input passed unchanged to command and subcommand handlers.
+/// Parsed input and working directory passed to command and subcommand handlers.
 #[derive(Debug, Clone)]
 pub struct Context {
     pub args: Args,
+    pub env: EnvContext,
+}
+
+/// Working directory only; loading this context never reads environment variables.
+#[derive(Debug, Clone)]
+pub struct EnvContext {
+    pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum ContextError {
+    Parse(Vec<ParseError>),
+}
+
+impl EnvContext {
+    /// Capture the process cwd, falling back to `.` if it is unavailable.
+    /// On wasm32, use `.` without accessing the host process.
+    pub fn load() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        #[cfg(target_arch = "wasm32")]
+        let cwd = PathBuf::from(".");
+        Self { cwd }
+    }
 }
 
 impl Context {
     pub fn new(args: Args) -> Self {
-        Self { args }
+        Self {
+            args,
+            env: EnvContext::load(),
+        }
+    }
+
+    /// Parse process arguments and capture the working directory.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_env(registry: &Registry) -> Result<Self, ContextError> {
+        let parsed = parse_env(registry);
+        if !parsed.errors.is_empty() {
+            return Err(ContextError::Parse(parsed.errors));
+        }
+        Ok(Self::new(parsed.args))
     }
 }
 
