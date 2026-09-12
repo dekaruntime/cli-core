@@ -65,6 +65,20 @@ See `examples/` for two complete wire-ups.
 Credentials for any private registry you consume this crate from belong
 in the caller's own Cargo configuration, never in this repository.
 
+## Mutable registry compatibility
+
+Existing `pub fn register(registry: &mut Registry)` functions can be passed to
+`RegistryBuilder::new().inherit(legacy).with(owner::register).build()`.
+`Registry` exposes Deka core's `new`, `add_command`, `add_flag`, and `add_param`
+methods with the same signatures.
+
+`CommandSpec` still requires the `owner` field introduced in 0.4.0. Legacy
+struct literals can use `owner: ""`; `.with()` tags newly appended commands
+with empty or whitespace-only owners as `"legacy"` and preserves explicit
+owners. `.register(specs)` still requires nonblank owners, `.inherit(specs)`
+still tags every inherited command as `"legacy"`, and `.build()` rejects
+duplicate command names across all registration paths.
+
 ## Build and test
 
 ```sh
