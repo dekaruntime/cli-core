@@ -106,10 +106,9 @@ monitor tests construct handler-bearing contexts. `tests/context_bridge.rs`
 checks the args/cwd projection and dispatch; the existing registry bridge tests
 continue to check mutable registration and `Context::new(args)` unchanged.
 
-Rust source compatibility caveat: adding the public `env` field requires old
-`Context { args }` struct literals to supply `env` or use `Context::new(args)`.
-The constructor, args field, parser, registry, and dispatch signatures are
-unchanged; this field addition cannot preserve args-only struct literals.
+Rust source compatibility caveat: context struct literals must migrate to
+`Context::new(args)` (see consumer extensions below). The constructor, public
+args/env fields, parser, registry, and dispatch signatures are unchanged.
 
 ## Build and test
 
@@ -129,3 +128,21 @@ This repository's history was extracted, full ancestry intact, from an
 earlier internal monorepo location and then renamed to its current crate
 name (`deka-cli-core`). Nothing about that predecessor affects the public
 API described above.
+
+### Consumer extensions
+
+Dispatchers can populate `context.extensions_mut().insert(state)` before handing
+`&Context` to command or subcommand handlers. Handlers retrieve concrete state via
+`context.extensions().get::<T>() -> Option<&T>`; the borrow lasts as long as the
+extension map borrow. Missing types return `None`; inserting the same type replaces
+its previous value. Values require `Any + Send + Sync`, but not `Clone` or `Debug`.
+
+`Context` remains `Clone`, `Debug`, `Send`, and `Sync`. Extensions store
+`TypeId -> Arc<dyn Any + Send + Sync>`: cloning a context copies its map and shares
+its values with cheap Arc clones. Replacement in one clone leaves the other map
+unchanged. Interior mutations of shared values are visible through both contexts.
+The registry-only implementation uses std and remains wasm32 compatible.
+
+The private extension map means consumers using `Context { args, env }` literals
+must migrate to `Context::new(args)` and then assign `context.env = env` when
+preserving an existing working directory.

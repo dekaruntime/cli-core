@@ -1,6 +1,6 @@
 #![cfg(feature = "registry")]
 
-use deka_cli_core::{Args, CommandSpec, Context, EnvContext, Registry};
+use deka_cli_core::{Args, CommandSpec, Context, Registry};
 use std::path::PathBuf;
 
 #[test]
@@ -32,12 +32,8 @@ fn consumer_owned_state_maps_to_shared_dispatch_without_recapturing_cwd() {
         cwd: PathBuf::from("consumer/workspace"),
         handler: "consumer-owned handler resolution".into(),
     };
-    let shared = Context {
-        args: product.args.clone(),
-        env: EnvContext {
-            cwd: product.cwd.clone(),
-        },
-    };
+    let mut shared = Context::new(product.args.clone());
+    shared.env.cwd = product.cwd.clone();
     registry.dispatch(&shared).unwrap();
     assert_eq!(product.handler, "consumer-owned handler resolution");
 }

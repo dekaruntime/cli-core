@@ -19,8 +19,9 @@ pub mod whoami;
 
 #[cfg(feature = "registry")]
 pub use registry::{
-    Args, BuildError, CommandSpec, Context, ContextError, DispatchError, EnvContext, FlagSpec,
-    ParamSpec, ParseError, ParseErrorKind, ParseOutcome, Registry, RegistryBuilder, SubcommandSpec,
+    Args, BuildError, CommandSpec, Context, ContextError, DispatchError, EnvContext, Extensions,
+    FlagSpec, ParamSpec, ParseError, ParseErrorKind, ParseOutcome, Registry, RegistryBuilder,
+    SubcommandSpec,
 };
 
 #[cfg(feature = "native")]
