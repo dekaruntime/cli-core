@@ -189,9 +189,7 @@ pub fn parse_env(registry: &Registry) -> ParseOutcome {
 
 #[derive(Debug, Default)]
 pub struct RegistryBuilder {
-    commands: Vec<CommandSpec>,
-    flags: Vec<FlagSpec>,
-    params: Vec<ParamSpec>,
+    registry: Registry,
 }
 
 impl RegistryBuilder {
@@ -199,9 +197,25 @@ impl RegistryBuilder {
         Self::default()
     }
 
+    /// Run an existing mutable registration function on the inner registry.
+    ///
+    /// Newly added commands with blank owners are tagged `"legacy"`. Explicit
+    /// owners are preserved, and validation still happens in [`Self::build`].
+    pub fn with(mut self, f: impl FnOnce(&mut Registry)) -> Self {
+        let first_new_command = self.registry.commands.len();
+        f(&mut self.registry);
+        for command in self.registry.commands.iter_mut().skip(first_new_command) {
+            if command.owner.trim().is_empty() {
+                command.owner = "legacy";
+            }
+        }
+        self
+    }
+
     /// Absorb commands that have not yet migrated to an owner crate.
     pub fn inherit(mut self, commands: impl IntoIterator<Item = CommandSpec>) -> Self {
-        self.commands
+        self.registry
+            .commands
             .extend(commands.into_iter().map(|mut command| {
                 command.owner = "legacy";
                 command
@@ -210,23 +224,23 @@ impl RegistryBuilder {
     }
 
     pub fn register(mut self, commands: impl IntoIterator<Item = CommandSpec>) -> Self {
-        self.commands.extend(commands);
+        self.registry.commands.extend(commands);
         self
     }
 
     pub fn flags(mut self, flags: impl IntoIterator<Item = FlagSpec>) -> Self {
-        self.flags.extend(flags);
+        self.registry.flags.extend(flags);
         self
     }
 
     pub fn params(mut self, params: impl IntoIterator<Item = ParamSpec>) -> Self {
-        self.params.extend(params);
+        self.registry.params.extend(params);
         self
     }
 
     pub fn build(self) -> Result<Registry, BuildError> {
         let mut seen = HashMap::new();
-        for command in &self.commands {
+        for command in &self.registry.commands {
             if command.owner != "legacy" && command.owner.trim().is_empty() {
                 return Err(BuildError::MissingOwner {
                     name: command.name.to_string(),
@@ -240,11 +254,7 @@ impl RegistryBuilder {
                 });
             }
         }
-        Ok(Registry {
-            commands: self.commands,
-            flags: self.flags,
-            params: self.params,
-        })
+        Ok(self.registry)
     }
 }
 
@@ -317,6 +327,22 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_command(&mut self, command: CommandSpec) {
+        self.commands.push(command);
+    }
+
+    pub fn add_flag(&mut self, flag: FlagSpec) {
+        self.flags.push(flag);
+    }
+
+    pub fn add_param(&mut self, param: ParamSpec) {
+        self.params.push(param);
+    }
+
     pub fn commands(&self) -> &[CommandSpec] {
         &self.commands
     }
@@ -521,7 +547,7 @@ mod tests {
         let parsed = Args::collect(vec!["--allow-read".to_string()], &security_registry());
         assert!(parsed.errors.is_empty());
         assert_eq!(parsed.args.flags.get("--allow-read"), Some(&true));
-        assert!(parsed.args.params.get("--allow-read").is_none());
+        assert!(!parsed.args.params.contains_key("--allow-read"));
     }
 
     #[test]
