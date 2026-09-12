@@ -522,7 +522,9 @@ fn levenshtein(a: &str, b: &str) -> usize {
         current[0] = i + 1;
         for (j, b_char) in b.chars().enumerate() {
             let cost = usize::from(a_char != b_char);
-            current[j + 1] = current[j].min(previous[j + 1]).min(previous[j] + cost);
+            current[j + 1] = (current[j] + 1)
+                .min(previous[j + 1] + 1)
+                .min(previous[j] + cost);
         }
         previous.clone_from_slice(&current);
     }
@@ -535,6 +537,42 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
+
+    #[test]
+    fn levenshtein_counts_each_edit() {
+        for (a, b, expected) in [
+            ("", "", 0),
+            ("", "abc", 3),
+            ("same", "same", 0),
+            ("cat", "cut", 1),
+            ("ab", "abcd", 2),
+            ("kitten", "sitting", 3),
+            ("é", "é猫", 1),
+            ("--hep", "--help", 1),
+            ("--hep", "--version", 6),
+            ("--hep", "--verbose", 6),
+        ] {
+            assert_eq!(levenshtein(a, b), expected, "{a:?} -> {b:?}");
+            assert_eq!(levenshtein(b, a), expected, "{b:?} -> {a:?}");
+        }
+    }
+
+    #[test]
+    fn misspelled_help_suggests_only_help() {
+        let registry = RegistryBuilder::new()
+            .flags(["--help", "--version", "--verbose"].map(|name| FlagSpec {
+                name,
+                aliases: &[],
+                description: "test flag",
+            }))
+            .build()
+            .expect("registry builds");
+
+        let parsed = Args::collect(vec!["--hep".to_string()], &registry);
+
+        assert_eq!(parsed.errors.len(), 1);
+        assert_eq!(parsed.errors[0].suggestions, ["--help"]);
+    }
 
     fn handler(_context: &Context) {
         HANDLER_RAN.store(true, Ordering::SeqCst);
